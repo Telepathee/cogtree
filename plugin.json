@@ -1,0 +1,9 @@
+{
+  "name": "cogtree",
+  "version": "1.0.0",
+  "description": "思维工作树:MCP 工具 + 本地 2D 实时视图,把「在想什么/试了什么/死在哪」落成跨会话可审计的树;3 次死路自动亮卡点",
+  "author": {
+    "name": "cogtree"
+  },
+  "mcpServers": ".mcp.json"
+}

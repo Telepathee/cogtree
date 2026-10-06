@@ -1,0 +1,827 @@
+<!doctype html>
+<html lang="zh">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>cogtree 工作树</title>
+<style>
+  html,body{margin:0;height:100%;overflow:hidden;font-family:"Microsoft YaHei","PingFang SC",system-ui,sans-serif;background:#f6f8fb;color:#1d2433}
+  #bar{position:fixed;top:0;left:0;right:0;height:46px;background:rgba(255,255,255,.92);backdrop-filter:blur(6px);border-bottom:1px solid #e8ecf2;display:flex;align-items:center;gap:10px;padding:0 14px;z-index:20;box-sizing:border-box}
+  #bar .logo{font-weight:800;font-size:15px;letter-spacing:.5px;background:linear-gradient(90deg,#2f6fed,#8a5fe8);-webkit-background-clip:text;background-clip:text;color:transparent;white-space:nowrap}
+  #bar select,#bar button{font:inherit;font-size:13px;padding:4px 12px;border:1px solid #d8deea;border-radius:8px;background:#fff;cursor:pointer;box-shadow:0 1px 2px rgba(20,30,60,.05)}
+  #bar button.on{background:linear-gradient(90deg,#2f6fed,#5b8bf3);border-color:#2f6fed;color:#fff}
+  #meta{color:#69738a;font-size:12.5px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+  #meta b{color:#c23a3a}
+  label.toggle{font-size:12.5px;color:#3d4658;display:flex;align-items:center;gap:4px;white-space:nowrap;cursor:pointer}
+  #stage{position:absolute;top:46px;left:0;right:0;bottom:0;width:100%;height:calc(100% - 46px);cursor:grab}
+  #stage.dragging{cursor:grabbing}
+  #stage.rotating{cursor:ew-resize}
+  #panel{position:fixed;top:46px;right:0;bottom:0;width:330px;background:#fff;border-left:1px solid #e8ecf2;padding:14px 16px;overflow:auto;display:none;box-sizing:border-box;z-index:20}
+  #panel h3{margin:0 0 8px;font-size:15px;padding-right:20px}
+  #panel .row{margin:6px 0;font-size:13px;line-height:1.55;word-break:break-all}
+  #panel .k{color:#7a8294;font-size:12px;margin-right:6px}
+  #panel .evt{color:#5c6577;font-size:12px;border-top:1px dashed #e8ecf2;margin-top:10px;padding-top:8px;line-height:1.7}
+  #close{position:absolute;top:8px;right:10px;border:none;background:none;font-size:15px;cursor:pointer;color:#7a8294}
+  #hint{position:absolute;top:60px;left:20px;color:#8a93a6;font-size:13px}
+  #tip{position:fixed;top:52px;left:50%;transform:translateX(-50%);background:#20293a;color:#e8ecf4;border-radius:999px;
+       padding:5px 16px;font-size:12px;display:none;z-index:25;pointer-events:none}
+  #hover{position:fixed;display:none;width:320px;background:#20293a;color:#e8ecf4;border-radius:10px;padding:12px 14px;
+         box-shadow:0 10px 32px rgba(15,22,36,.4);z-index:30;pointer-events:none;font-size:12.5px;line-height:1.6}
+  #hover .t{font-size:14px;font-weight:700;margin-bottom:4px}
+  #hover .kv{margin:2px 0;word-break:break-all}
+  #hover .k{color:#93a0b8;margin-right:6px}
+  #hover .evt{color:#93a0b8;border-top:1px dashed #3a465e;margin-top:6px;padding-top:6px;font-size:11.5px}
+</style>
+</head>
+<body>
+<div id="bar">
+  <span class="logo">cogtree 工作树</span>
+  <select id="treesel"></select>
+  <span id="meta"></span>
+  <span id="build" title="viewer 构建时间(两边不一致时对比这里)" style="color:#9aa5ba;font-size:11.5px;white-space:nowrap"></span>
+  <span style="flex:1"></span>
+  <label class="toggle"><input type="checkbox" id="cb-dead">折叠死路子树</label>
+  <button id="focus" title="以当前节点为中心:祖先链+同辈窗口+子代">邻域聚焦</button>
+  <button id="pano" title="看整棵树:顶层主干全亮,各层窗口3个">全景视图</button>
+  <button id="expand" title="展开全部节点,看整棵树的完整结构">展开全部</button>
+  <button id="tidy" title="收起到仅剩顶层主干;点击任意站点回到该处">收纳主干</button>
+  <button id="fit">适配视图</button>
+</div>
+<svg id="stage" xmlns="http://www.w3.org/2000/svg"><g id="vp"></g></svg>
+<div id="hint" style="display:none">还没有工作树——在对话里让模型调 tree_init 建一棵,这里会实时出现。</div>
+<div id="tip"></div>
+<div id="hover"></div>
+<div id="panel"><button id="close" title="关闭">✕</button><div id="pbody"></div></div>
+<script>
+"use strict";
+var COLOR={open:"#8a93a6",active:"#2f6fed",blocked:"#e6892f",resolved:"#2fa14d",dead_end:"#c23a3a",abandoned:"#b7bdc8"};
+var KIND={problem:"拆解",explore:"发散",attempt:"尝试",finding:"结论",decision:"裁决",step:"步骤"};
+var KCOL={problem:"#69738a",step:"#2f6fed",explore:"#8a5fe8",attempt:"#0e9888",finding:"#2fa14d",decision:"#b05e12"};
+var STAT={open:"待办",active:"进行中",blocked:"受阻",resolved:"已解决",dead_end:"死路",abandoned:"放弃"};
+var CIRC="①②③④⑤⑥⑦⑧⑨⑩⑪⑫⑬⑭⑮⑯⑰⑱⑲⑳";
+var W=228,H=80,GX=10,GV=40,WIN=3,MAXDOTS=8;
+var S={cur:null,st:null,es:null,poll:null,tx:60,ty:40,scale:1,sel:null,collapse:false,
+       focus:true,center:null,open:{},sibRot:{},rotAcc:{},rotatePreview:null,pos:{},byId:{},kidsBy:{},thumbSet:{},stepSeq:{},depth:{},animTok:0,viewTok:0,dragMoved:false,expandAll:false,tidy:false};
+var stage=document.getElementById("stage"),vp=document.getElementById("vp");
+
+function esc(s){return String(s==null?"":s).replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;").replace(/\"/g,"&quot;")}
+function clip(s,n){s=String(s==null?"":s);return s.length>n?s.slice(0,n-1)+"…":s}
+function meta(html){document.getElementById("meta").innerHTML=html}
+function tip(msg){
+  var el=document.getElementById("tip");
+  if(!msg){el.style.display="none";return}
+  el.textContent=msg;el.style.display="block";
+}
+
+function hashTree(){
+  try{ if(location.hash.length>1)return decodeURIComponent(location.hash.slice(1)); }catch(e){}
+  return null;
+}
+var BUILD="__COGTREE_BUILD__";
+window.addEventListener("hashchange",function(){
+  var w=hashTree();
+  if(w&&w!==S.cur){
+    var sel=document.getElementById("treesel");
+    if(sel)sel.value=w;
+    load(w);
+  }
+});
+async function boot(){
+  var b=document.getElementById("build");
+  if(b)b.textContent="构建 "+(BUILD.indexOf("__")===0?"dev":BUILD);
+  var j=await (await fetch("/api/trees")).json();
+  var trees=j.trees||[];
+  var sel=document.getElementById("treesel");
+  sel.innerHTML="";
+  trees.forEach(function(t){var o=document.createElement("option");o.value=t.tree_id;o.textContent=t.name;sel.appendChild(o)});
+  sel.onchange=function(){load(sel.value)};
+  document.getElementById("hint").style.display=trees.length?"none":"block";
+  if(trees.length){
+    var want=hashTree();
+    var pick=(want&&trees.some(function(t){return t.tree_id===want}))?want:trees[0].tree_id;
+    sel.value=pick;
+    load(pick);
+  }else meta("");
+}
+async function load(id){
+  S.cur=id;S.sel=null;S.center=null;S.open={};S.sibRot={};S.rotAcc={};S.rotatePreview=null;
+  S.pos={}; // 换树清动画基线,避免节点从旧树布局位置飞入
+  var wantHash=encodeURIComponent(id);
+  if(location.hash.slice(1)!==wantHash)location.hash=wantHash; // URL 锚点记录当前树,两边可开同一地址
+  S.st=await (await fetch("/api/tree/"+encodeURIComponent(id))).json();
+  connect();render();setTimeout(fit,80);setTimeout(fit,500); // 二次适配:防重叠兜底可能右移边界
+  document.getElementById("panel").style.display="none";
+}
+function connect(){
+  if(S.es)S.es.close();
+  if(S.poll){clearInterval(S.poll);S.poll=null}
+  var es=new EventSource("/api/stream/"+encodeURIComponent(S.cur));
+  S.es=es;
+  es.addEventListener("state",function(e){S.st=JSON.parse(e.data);render()});
+  es.onerror=function(){
+    if(!S.poll)S.poll=setInterval(function(){
+      if(!S.cur)return;
+      fetch("/api/tree/"+encodeURIComponent(S.cur)).then(function(r){return r.json()})
+        .then(function(j){S.st=j;render()}).catch(function(){});
+    },1500);
+  };
+}
+
+function kidsOf(id){return (S.kidsBy[id]||[]).slice().sort()}
+function roundsOf(n){return n.rounds_sub!=null?n.rounds_sub:(n.rounds||0)}
+function descCount(id){
+  var n=0,stack=kidsOf(id);
+  while(stack.length){var x=stack.pop();n++;stack=kidsOf(x).concat(stack)}
+  return n;
+}
+function windowOf(pid){
+  var ks=kidsOf(pid),n=ks.length;
+  if(n<=WIN)return{full:ks,thumb:[]};
+  var rot=((S.sibRot[pid]||0)%n+n)%n;
+  var full=[],thumb=[];
+  for(var i=0;i<n;i++)(i<WIN?full:thumb).push(ks[(rot+i)%n]);
+  return{full:full,thumb:thumb};
+}
+
+function focusSets(){
+  var center=S.sel;
+  if(!center){
+    var act=S.st.nodes.filter(function(n){return n.status==="active"});
+    center=act.length?act[act.length-1].id:(S.st.nodes[0]?S.st.nodes[0].id:null);
+  }
+  var full={},thumb={};
+  if(!center)return{center:null,full:full,thumb:thumb};
+  full[center]=1;
+  var parentOf={};S.st.nodes.forEach(function(n){if(n.parent_id)parentOf[n.id]=n.parent_id});
+  var c=center,depth=0;
+  while(parentOf[c]&&depth<5){full[parentOf[c]]=1;c=parentOf[c];depth++}
+  var w=windowOf(center);
+  w.full.forEach(function(k){full[k]=1});
+  w.thumb.forEach(function(k){thumb[k]=1});
+  return{center:center,full:full,thumb:thumb};
+}
+
+function computeVisibility(){
+  // 单趟三态分类:每个节点恰好归入 全尺寸(full)/芯片(chip)/隐藏(hidden) 之一
+  var hidden={},chip={},full={};
+  if(!S.st)return hidden;
+  S.kidsBy={};
+  S.st.nodes.forEach(function(n){if(n.parent_id)(S.kidsBy[n.parent_id]=S.kidsBy[n.parent_id]||[]).push(n.id)});
+  var byId={}; // 本帧新鲜种类表
+  S.st.nodes.forEach(function(n){byId[n.id]=n});
+  function descendantsHidden(id){ // 芯片/折叠节点的后代全部隐藏
+    var stack=kidsOf(id);
+    while(stack.length){var x=stack.pop();if(!hidden[x]){hidden[x]=1;stack=kidsOf(x).concat(stack)}}
+  }
+  function isStep(id){return !!(byId[id]&&byId[id].kind==="step")}
+  // (折叠死路/展开覆盖在模式分支之后统一执行,见下方)
+  var parentOf={};S.st.nodes.forEach(function(n){if(n.parent_id)parentOf[n.id]=n.parent_id});
+  if(S.expandAll){
+    // 展开全部:所有节点全尺寸,无窗口无芯片
+    S.center=null;
+    S.st.nodes.forEach(function(n){full[n.id]=1});
+  }else if(S.tidy){
+    // 收纳:仅根+顶层主干站点
+    S.center=null;
+    full[S.st.root_id]=1;
+    kidsOf(S.st.root_id).forEach(function(s){ if(isStep(s))full[s]=1; });
+  }else if(S.focus){
+    var center=S.sel;
+    if(!center){
+      var act=S.st.nodes.filter(function(n){return n.status==="active"});
+      center=act.length?act[act.length-1].id:(S.st.nodes[0]?S.st.nodes[0].id:null);
+    }
+    S.center=center;
+    if(center){
+      full[center]=1;
+      var chain={};var c=center;while(c){chain[c]=1;c=parentOf[c];}
+      chain[S.st.root_id]=1;
+      for(var X in chain){
+        full[X]=1; // 链上节点(含根)全尺寸
+        kidsOf(X).forEach(function(s){ if(isStep(s))full[s]=1; });
+      }
+      var pc=parentOf[center];
+      if(pc!=null){
+        var w=windowOf(pc);
+        w.full.forEach(function(k){full[k]=1});
+        w.thumb.forEach(function(k){chip[k]=1});
+      }
+      var wc=windowOf(center); wc.full.forEach(function(k){full[k]=1}); wc.thumb.forEach(function(k){chip[k]=1});
+      for(var X2 in chain){
+        kidsOf(X2).forEach(function(k){ if(!full[k])chip[k]=1; });
+      }
+    }
+  }else{
+    S.center=null;
+    full[S.st.root_id]=1; // 根入册(缺了它根会被隐藏,整棵子树失去坐标)
+    kidsOf(S.st.root_id).forEach(function(s){ if(isStep(s))full[s]=1; });
+    for(var pid in S.kidsBy){
+      var w=windowOf(pid);
+      w.full.forEach(function(k){full[k]=1});
+      w.thumb.forEach(function(k){chip[k]=1});
+    }
+  }
+  // 转盘覆盖:旋转排及其全部子树显示出来(整体跟随偏移,不再隐藏)
+  if(S.rotatePreview!=null){
+    kidsOf(S.rotatePreview.parent).forEach(function(k){
+      delete hidden[k]; delete chip[k]; full[k]=1;
+      var dstack=kidsOf(k);
+      while(dstack.length){
+        var dx_=dstack.pop();
+        delete hidden[dx_]; delete chip[dx_]; full[dx_]=1;
+        dstack=dstack.concat(kidsOf(dx_));
+      }
+    });
+  }
+  // 显式展开集:整棵子树全尺寸,可同时展开多个,跨模式生效
+  for(var oid in S.open){
+    if(!S.open[oid])continue;
+    delete chip[oid];delete hidden[oid];full[oid]=1; // 展开者本身点亮
+    var ostack=[oid];
+    while(ostack.length){
+      var ocur=ostack.pop();
+      kidsOf(ocur).forEach(function(k){
+        full[k]=1;delete chip[k];delete hidden[k];
+        ostack.push(k);
+      });
+    }
+  }
+  // 硬隐藏:折叠死路子树(最终仍生效,优先于显式展开)
+  if(S.collapse&&!S.expandAll&&!S.tidy){
+    S.st.nodes.forEach(function(n2){
+      if(n2.kind==="attempt"&&n2.status==="dead_end")descendantsHidden(n2.id);
+    });
+  }
+  // 2) 全尺寸优先:full 成员从 chip 除名(含被窗口转出的中心/站点)
+  S.st.nodes.forEach(function(n){ if(full[n.id])delete chip[n.id]; });
+  // 3) 芯片的后代隐藏(芯片集此刻已定);转盘父节点豁免(条带就是它的孩子)
+  for(var cid in chip){
+    if(S.rotatePreview&&cid===S.rotatePreview.parent)continue;
+    if(S.open&&S.open[cid])continue; // 已显式展开的子树不再隐藏其后代
+    descendantsHidden(cid);
+  }
+  // 4) 终裁:硬隐藏 > 全尺寸 > 芯片 > 隐藏
+  S.st.nodes.forEach(function(n){
+    if(hidden[n.id])return;
+    if(full[n.id]){delete chip[n.id];return}
+    if(chip[n.id]){delete full[n.id];return}
+    hidden[n.id]=1;
+  });
+  S.thumbSet=chip;
+  return hidden;
+}
+function layout(hidden){
+  var byId={};S.st.nodes.forEach(function(n){byId[n.id]=n});
+  S.byId=byId;
+  var kids={}; // 渐隐卡也是全尺寸,参与常规布局
+  S.st.nodes.forEach(function(n){
+    if(n.parent_id&&!hidden[n.id]&&!hidden[n.parent_id])
+      (kids[n.parent_id]=kids[n.parent_id]||[]).push(n.id);
+  });
+  var root=null;S.st.nodes.forEach(function(n){if(!n.parent_id)root=n.id});
+  var leafX=0;S.pos={};S.byId=byId;S.ext={};S.depth={};
+  if(root==null)return;
+  (function place(id,depth){ // 纵向:深度向下;内部节点左对齐子树首列,消除居中空档
+    var cs=(kids[id]||[]).slice().sort();
+    var x,y;
+    if(!cs.length){x=24+leafX*(W+GX);y=24+depth*(H+GV);leafX++}
+    else{
+      cs.forEach(function(c){place(c,depth+1)});
+      x=(S.pos[cs[0]].x+S.pos[cs[cs.length-1]].x)/2; // 居中于子树首末两列,左右对称
+      y=24+depth*(H+GV);
+    }
+    S.pos[id]={x:x,y:y};S.depth[id]=depth;
+    var ext=x+W;
+    cs.forEach(function(c){ext=Math.max(ext,S.ext[c])});
+    S.ext[id]=ext;
+    return ext;
+  })(root,0);
+  // 主干站点等距:站间距与子树宽度解耦(子树在下方流动,冲突由兜底右移处理)
+  function shiftSubtree(id,dx){
+    if(!S.pos[id])return;
+    S.pos[id].x+=dx;S.ext[id]=(S.ext[id]||0)+dx;
+    (kids[id]||[]).forEach(function(c){shiftSubtree(c,dx)});
+  }
+  for(var pid3 in kids){
+    var sts=(kids[pid3]||[]).slice().sort().filter(function(k){return byId[k]&&byId[k].kind==="step"});
+    if(sts.length<2)continue;
+    var pitch=W+38,x0=S.pos[sts[0]].x;
+    for(var si=1;si<sts.length;si++){
+      // 站距 = max(等距目标, 前一站子树右缘+间隙);只右移补齐,绝不左压
+      // (左压会把邻近子树压进彼此的行内,造成子树交错)
+      var floorX=Math.max(x0+si*pitch, S.ext[sts[si-1]]+30);
+      var dx=floorX-S.pos[sts[si]].x;
+      if(dx>0)shiftSubtree(sts[si],dx);
+    }
+    // 站间距调整后,父节点按全部可见子树的实际跨度重新居中
+    var mn=null,mx=null;
+    kids[pid3].forEach(function(c){
+      if(!S.pos[c])return;
+      if(mn===null||S.pos[c].x<mn)mn=S.pos[c].x;
+      var e2=S.ext[c]||(S.pos[c].x+W);
+      if(mx===null||e2>mx)mx=e2;
+    });
+    if(mn!==null){ S.pos[pid3].x=(mn+mx)/2-W/2; S.ext[pid3]=Math.max(mx,S.pos[pid3].x+W); }
+  }
+  // 防遮挡兜底:可见卡片两两不相交,同高度带内的冲突者右移(缩略堆等的安全网)
+  for(var pass=0;pass<3;pass++){
+    var vis=[];
+    for(var id2 in S.pos){
+      if(hidden[id2])continue;
+      vis.push({id:id2,x:S.pos[id2].x,y:S.pos[id2].y,w:W,h:H});
+    }
+    vis.sort(function(a,b){return a.x-b.x});
+    var moved=false;
+    for(var i2=0;i2<vis.length;i2++)for(var j2=i2+1;j2<vis.length;j2++){
+      var A=vis[i2],B=vis[j2];
+      if(A.x>=B.x+B.w)continue;
+      var yOv=Math.min(A.y+A.h,B.y+B.h)-Math.max(A.y,B.y);
+      var xOv=Math.min(A.x+A.w,B.x+B.w)-Math.max(A.x,B.x);
+      if(yOv>4&&xOv>0){
+        var mv=(B.x>=A.x?B:A),anch=(mv===B?A:B);
+        // 站点(主干步骤)不推,优先推子树卡
+        if(byId[mv.id]&&byId[mv.id].kind==="step"&&!(byId[anch.id]&&byId[anch.id].kind==="step")){
+          mv=anch;anch=(mv===A?B:A);
+        }
+        var nx=anch.x+anch.w+10;
+        if(nx>mv.x){mv.x=nx;S.pos[mv.id].x=nx;moved=true}
+      }
+    }
+    if(!moved)break;
+  }
+  // 转盘:旋转排及其子树整体跟随偏移(拖到哪滑到哪)
+  if(S.rotatePreview){
+    var rpt=S.rotatePreview,stp=W+38;
+    kidsOf(rpt.parent).forEach(function(k){ shiftSubtree(k,rpt.offset*stp); });
+  }
+  S.stepSeq={};
+  for(var pid2 in kids){
+    var i=0;
+    (kids[pid2]||[]).slice().sort().forEach(function(k){
+      if(byId[k]&&byId[k].kind==="step")S.stepSeq[k]=++i;
+    });
+  }
+}
+
+function resultLine(n){
+  if(n.status==="dead_end"&&n.why)return{t:"为何不通: "+n.why,c:"#c23a3a"};
+  if(n.status==="resolved"){
+    var s=n.detail||n.note;
+    if(s)return{t:"结果: "+s,c:"#1f7a3d"};
+  }
+  if(n.status==="blocked"&&n.note)return{t:"受阻: "+n.note,c:"#b05e12"};
+  return null;
+}
+
+function dotsSvg(n){
+  var r=roundsOf(n);
+  if(!r)return"";
+  var shown=Math.min(r,MAXDOTS),s="";
+  for(var i=0;i<shown;i++)s+='<circle cx="'+(W-9-8*i)+'" cy="12" r="3" fill="#9aa5ba"/>';
+  if(r>MAXDOTS)s+='<text x="'+(W-9-8*shown-2)+'" y="15.5" font-size="10" fill="#9aa5ba" text-anchor="end">×'+r+'</text>';
+  return s+"<title>"+esc("轮次: "+r+" 轮(含其下全部问题)")+"</title>";
+}
+
+function chip(label,color){
+  var w=label.length*10+12;
+  return {w:w,svg:'<rect width="'+w+'" height="16" rx="8" fill="'+color+'"/>'+
+    '<text x="'+(w/2)+'" y="11" font-size="9.5" fill="#fff" text-anchor="middle" font-weight="600">'+esc(label)+'</text>'};
+}
+
+function cardFull(n,p,stuck,op){
+  var opa=(op==null||op>=0.999)?1:op;
+  var dimmed=opa<0.999;
+  var col=COLOR[n.status];
+  var isStep=n.kind==="step";
+  var seq=S.stepSeq[n.id]||0;
+  var strike=n.status==="dead_end"?' text-decoration="line-through"':"";
+  var isCenter=S.sel===n.id||S.center===n.id;
+  var tint=n.status==="dead_end"?"#fdf3f3":(isStep?"#f4f8ff":"#ffffff");
+  var stroke=isCenter?' stroke="#2f6fed" stroke-width="2.2"':(isStep?' stroke="#a9c4f7" stroke-width="1.4"':' stroke="#e6eaf2" stroke-width="1"');
+  var ring="";
+  if(stuck[n.id]){
+    ring='<circle cx="'+(W/2)+'" cy="'+(H/2)+'" r="40" fill="none" stroke="#c23a3a" stroke-width="2">'+
+      '<animate attributeName="r" values="36;44;36" dur="1.6s" repeatCount="indefinite"/>'+
+      '<animate attributeName="stroke-opacity" values="0.9;0.25;0.9" dur="1.6s" repeatCount="indefinite"/></circle>';
+  }
+  var kidsN=kidsOf(n.id).length;
+  var fold="";
+  if(kidsN&&!S.expandAll){
+    var isOpen=!!S.open[n.id];
+    fold='<g transform="translate('+(W-12)+','+(H-15)+')" style="cursor:pointer" class="foldbtn" data-fold="'+n.id+'">'+
+      '<title>'+(isOpen?"收起整棵子树":"展开整棵子树(可同时展开多个)")+'</title>'+
+      '<circle r="8" fill="'+(isOpen?"#e3edff":"#eef1f6")+'" stroke="'+(isOpen?"#8fb0ee":"#d8deea")+'"/>'+
+      '<text y="3.5" font-size="9" text-anchor="middle" fill="'+(isOpen?"#2f6fed":"#5c6577")+'">'+(isOpen?"▾":"▸")+'</text></g>';
+  }
+  var headLabel=isStep?("主干 "+(CIRC[seq-1]||seq)):KIND[n.kind];
+  var c=chip(headLabel,KCOL[n.kind]||"#69738a");
+  var head='<g transform="translate(12,8)">'+c.svg+'</g>'+
+    '<text x="'+(12+c.w+6)+'" y="20" font-size="10" fill="#9aa5ba">'+
+    esc(clip(n.id+(n.attempts>0?" · 试"+n.attempts+"次":""),14))+'</text>';
+  var title='<text x="13" y="41" font-size="14" font-weight="600" fill="#1d2433"'+strike+">"+esc(clip(n.title,14))+
+    "<title>"+esc(n.title)+"</title></text>";
+  var detail=n.detail?'<text x="13" y="58" font-size="10.5" fill="#7a8294">'+esc(clip(n.detail,19))+
+    "<title>"+esc(n.detail)+"</title></text>":"";
+  var rl=resultLine(n);
+  var result=rl?'<text x="13" y="'+(H-10)+'" font-size="10.5" fill="'+rl.c+'">'+esc(clip(rl.t,14))+
+    "<title>"+esc(rl.t)+"</title></text>":"";
+  var stTx='<text x="'+(W-26)+'" y="'+(H-10)+'" font-size="10.5" fill="'+(stuck[n.id]?"#c23a3a":col)+'"'+
+    (stuck[n.id]?' font-weight="700"':'')+' text-anchor="end">'+esc(STAT[n.status])+'</text>';
+  var active=n.status==="active"?'<g transform="translate(-14,'+(H/2)+')"><circle r="9" fill="#2f6fed"/>'+
+    '<path d="M-3 -5L5 0L-3 5z" fill="#fff"/></g>':"";
+  return '<g transform="translate('+p.x+','+p.y+')" style="cursor:pointer" opacity="'+opa+'"'+(dimmed?' data-thumb="1"':'')+' data-id="'+n.id+'">'+
+    '<rect width="'+W+'" height="'+H+'" rx="12" fill="'+tint+'"'+stroke+' filter="url(#cshadow)"/>'+
+    '<rect width="5" height="'+H+'" rx="2.5" fill="'+col+'"/>'+
+    ring+head+title+detail+result+stTx+dotsSvg(n)+fold+active+"</g>";
+}
+
+function fadeFor(id){ // 渐隐:离同辈窗口越远越淡(窗口内=1)
+  var n=S.byId[id];
+  if(!n)return 1;
+  var rp=S.rotatePreview;
+  if(rp&&n.parent_id===rp.parent){
+    var wr=windowOf(rp.parent),ir=wr.thumb.indexOf(id);
+    return ir<0?1:Math.max(0.08,0.5-0.18*ir);
+  }
+  if(!S.thumbSet||!S.thumbSet[id])return 1;
+  if(!n.parent_id)return 0.45;
+  var w=windowOf(n.parent_id),i=w.thumb.indexOf(id);
+  return i<0?1:Math.max(0.08,0.5-0.18*i);
+}
+function render(){
+  hideHover();
+  var prev=S.pos||{}; // 上一帧位置,供位移动画
+  if(!S.st||!S.st.nodes||!S.st.nodes.length){vp.innerHTML="";meta("");return}
+  var hidden=computeVisibility();
+  layout(hidden);
+  var stuck=S.st.stuck||{};
+
+  // 主干带:同辈可见 step 连成一条渐变粗线,站点(卡)压在线上;连接线从父节点下来
+  // 注意:水平线段包围盒高度为0,objectBoundingBox 渐变会失效,必须用圆角矩形承载
+  var bands="",banded={};
+  for(var pid in S.kidsBy){
+    var steps=kidsOf(pid).filter(function(k){return S.byId[k]&&S.byId[k].kind==="step"&&!hidden[k]&&!S.thumbSet[k]});
+    if(!steps.length)continue;
+    try{
+    steps.forEach(function(k){banded[k]=1});
+    var y=S.pos[steps[0]].y+H/2;
+    var x1=S.pos[steps[0]].x-16,x2=S.pos[steps[steps.length-1]].x+W+18;
+    var bw=Math.max(4,6-(S.depth[steps[0]]||1));
+    if(S.pos[pid]){
+      var px=S.pos[pid].x+W/2,py=S.pos[pid].y+H;
+      // 走廊布线:在父行与站点行之间的空带水平横移,再落入带首——绝不穿过任何卡片
+      var topY=y-H/2-14,midY=py+(topY-py)*0.5;
+      if(py<topY)bands+='<path d="M'+px+' '+py+' L'+px+' '+midY+' L'+x1+' '+midY+' L'+x1+' '+y+
+        '" fill="none" stroke="#2f6fed" stroke-width="3" stroke-opacity="0.55" stroke-linecap="round" stroke-linejoin="round"/>';
+    }
+    bands+='<rect x="'+x1+'" y="'+(y-bw/2)+'" width="'+(x2-x1)+'" height="'+bw+'" rx="'+(bw/2)+
+      '" fill="url(#bandg)"/>';
+    bands+='<path d="M'+(x2-10)+' '+(y-6)+'L'+(x2-2)+' '+y+'L'+(x2-10)+' '+(y+6)+
+      '" fill="none" stroke="#5b8bf3" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"/>';
+    }catch(e){
+      window.__bandErr={msg:String(e),pid:pid,steps:steps.join(","),
+        laid:steps.map(function(k){return k+":"+(S.pos[k]?"Y":"N")}).join(","),
+        hiddenPid:!!hidden[pid],thumbPid:!!S.thumbSet[pid]};
+      break;
+    }
+  }
+
+  var edges="";
+  S.st.nodes.forEach(function(n){
+    if(!n.parent_id||hidden[n.id]||hidden[n.parent_id])return;
+    if(S.thumbSet[n.id])return; // 芯片贴在父节点下方,不拉线
+    if(banded[n.id])return; // 主干带已接管
+    var p=S.pos[n.parent_id],c=S.pos[n.id];
+    if(!p||!c)return;
+    var x1=p.x+W/2,y1=p.y+H,x2=c.x+W/2,y2=c.y+H/2,col=COLOR[n.status]||"#999";
+    edges+='<path d="M'+x1+' '+y1+' C'+x1+' '+(y1+GV/2+14)+','+x2+' '+(y2-GV/2-14)+','+x2+' '+y2+
+      '" fill="none" stroke="'+col+'" stroke-opacity="0.35" stroke-width="2" stroke-linecap="round"/>';
+  });
+
+  var cards="";
+  S.st.nodes.slice().sort(function(a,b){return a.id<b.id?-1:1}).forEach(function(n){
+    if(hidden[n.id]||!S.pos[n.id])return;
+    cards+=cardFull(n,S.pos[n.id],stuck,fadeFor(n.id));
+  });
+  vp.innerHTML='<defs>'+
+    '<pattern id="dots" width="26" height="26" patternUnits="userSpaceOnUse"><circle cx="1.6" cy="1.6" r="1.4" fill="#e4e9f1"/></pattern>'+
+    '<linearGradient id="bandg" x1="0" y1="0" x2="1" y2="0"><stop offset="0" stop-color="#2f6fed"/><stop offset="1" stop-color="#7aa5f5"/></linearGradient>'+
+    '<marker id="arw" viewBox="0 0 10 10" refX="8.5" refY="5" markerWidth="6.5" markerHeight="6.5" orient="auto-start-reverse">'+
+    '<path d="M0 0L10 5L0 10z" fill="#5b8bf3"/></marker>'+
+    '<filter id="cshadow" x="-30%" y="-30%" width="160%" height="160%">'+
+    '<feDropShadow dx="0" dy="2" stdDeviation="3.2" flood-color="#20304f" flood-opacity="0.12"/></filter>'+
+    '</defs>'+
+    '<rect id="bg" x="-6000" y="-6000" width="16000" height="16000" fill="url(#dots)"/>'+
+    '<g id="ebox">'+bands+edges+'</g>'+cards;
+  var ebox=document.getElementById("ebox");
+  if(ebox){ebox.style.opacity="0.3";ebox.style.transition="opacity .18s ease";
+    requestAnimationFrame(function(){ebox.style.opacity="1"})}
+
+  // 动画:位移缓动+淡入;隐藏页直接落定;300ms 后自愈收敛(过渡被可见性切换冻结的兜底)
+  var tok=(S.animTok=(S.animTok||0)+1);
+  var canAnim=(!document.hidden)&&!S.noAnim&&!S.rotatePreview; // 转盘期条带跟手;测试可置 S.noAnim
+  vp.querySelectorAll("g[data-id]").forEach(function(g){
+    var id=g.getAttribute("data-id");
+    var nw=S.pos[id],old=prev[id];
+    if(old&&(old.x!==nw.x||old.y!==nw.y)){
+      if(!canAnim){g.setAttribute("transform","translate("+nw.x+","+nw.y+")");return}
+      var sx=old.x-nw.x,sy=old.y-nw.y,t0=null;
+      var stepMove=function(ts){
+        if(tok!==S.animTok)return;
+        if(t0===null)t0=ts;
+        var k=Math.min(1,(ts-t0)/230);k=1-Math.pow(1-k,3);
+        g.setAttribute("transform","translate("+(nw.x+sx*(1-k))+","+(nw.y+sy*(1-k))+")");
+        if(k<1)requestAnimationFrame(stepMove);
+        else g.setAttribute("transform","translate("+nw.x+","+nw.y+")");
+      };
+      requestAnimationFrame(stepMove);
+    }else if(!old&&canAnim){
+      var tgt=g.getAttribute("opacity")||"1";
+      g.style.opacity="0";
+      g.style.transition="opacity .22s ease";
+      requestAnimationFrame(function(){
+        if(tok!==S.animTok)return;
+        g.style.opacity=tgt;
+        setTimeout(function(){if(tok===S.animTok){g.style.transition="";g.style.opacity="";}},260);
+      });
+    }
+  });
+  setTimeout(function(){
+    if(tok!==S.animTok)return;
+    vp.querySelectorAll('g[data-id]').forEach(function(g){
+      g.style.transition="none";g.style.opacity=""; // 清内联,渐隐由属性控制
+      var nw2=S.pos[g.getAttribute("data-id")]; // 后台冻结时从半路落定到终点
+      if(nw2)g.setAttribute("transform","translate("+nw2.x+","+nw2.y+")");
+    });
+    var eb=document.getElementById("ebox");
+    if(eb){eb.style.transition="";eb.style.opacity="1";}
+  },300);
+
+  vp.querySelectorAll("g[data-id]").forEach(function(g){
+    var id=g.getAttribute("data-id");
+    g.addEventListener("click",function(ev){
+      ev.stopPropagation();
+      if(S.dragMoved){S.dragMoved=false;return;} // 拖拽收尾的伪 click 不选中
+      select(id,g.getAttribute("data-thumb")==="1");
+    });
+    g.addEventListener("mouseenter",function(ev){hoverTimer=setTimeout(function(){showHover(id,ev)},160)});
+    g.addEventListener("mousemove",function(ev){if(hoverOn)moveHover(ev)});
+    g.addEventListener("mouseleave",hideHover);
+  });
+  vp.querySelectorAll("g.foldbtn").forEach(function(g){
+    g.addEventListener("click",function(ev){
+      ev.stopPropagation();
+      if(S.dragMoved){S.dragMoved=false;return;} // 拖拽收尾的伪 click 不折叠
+      var id=g.getAttribute("data-fold");
+      S.open[id]=!S.open[id]; // 子树展开开关:可同时展开多个
+      render();fit();
+      setTimeout(function(){fit()},350);
+    });
+  });
+  var ns=Object.keys(stuck).length;
+  meta("节点 "+S.st.nodes.length+" · 事件 "+S.st.seq+" · "+(ns?("<b>卡点 "+ns+"</b>"):"无卡点")+
+    " · hash "+S.st.state_hash+" · "+S.st.updated_at);
+}
+
+function select(id,isThumb){
+  if(isThumb){
+    var n=S.byId[id];
+    if(n&&n.parent_id){
+      var idx=kidsOf(n.parent_id).indexOf(id);
+      if(idx>=0)S.sibRot[n.parent_id]=idx;
+    }
+  }
+  // 点卡片不再切换模式(留在当前模式,可连续展开多棵子树)
+  S.sel=id;
+  render();
+  if(S.focus){
+    document.getElementById("panel").style.display="none"; // 聚焦=导航:详情属全景,清残留侧栏
+    fit(); if(!S.noAnim)setTimeout(fit,320);
+  }else if(!isThumb) showPanel(id); // 全景点卡=看详情;点芯片=只旋进窗口,不弹侧栏
+}
+
+var hoverOn=false,hoverTimer=null;
+function showHover(id,ev){
+  var n=S.byId[id];if(!n)return;
+  var evts=(S.st.events||[]).filter(function(e){return e.node_id===id}).slice(-3);
+  var h='<div class="t">'+esc(n.title)+'</div>';
+  h+='<div class="kv"><span class="k">类型</span>'+esc(KIND[n.kind]+" · "+STAT[n.status])+"</div>";
+  h+='<div class="kv"><span class="k">刻度</span>'+esc("轮次 "+roundsOf(n)+" · 尝试 "+n.attempts+" 次")+"</div>";
+  if(n.detail)h+='<div class="kv"><span class="k">描述</span>'+esc(n.detail)+"</div>";
+  if(n.why)h+='<div class="kv"><span class="k">why</span>'+esc(n.why)+"</div>";
+  if(n.note)h+='<div class="kv"><span class="k">备注</span>'+esc(n.note)+"</div>";
+  if(evts.length)h+='<div class="evt">'+evts.map(function(e){
+    var s=e.ts+" "+e.op;
+    if(e.fields&&e.fields.status)s+=" → "+e.fields.status;
+    if(e.op==="node_touch"&&e.note)s+=": "+e.note;
+    return esc(s);
+  }).join("<br>")+"</div>";
+  var el=document.getElementById("hover");
+  el.innerHTML=h;el.style.display="block";
+  hoverOn=true;moveHover(ev);
+}
+function moveHover(ev){
+  var el=document.getElementById("hover");
+  var w=el.offsetWidth,hh=el.offsetHeight;
+  var x=ev.clientX+16,y=ev.clientY+16;
+  if(x+w>window.innerWidth-10)x=ev.clientX-w-16;
+  if(y+hh>window.innerHeight-10)y=ev.clientY-hh-16;
+  el.style.left=x+"px";el.style.top=y+"px";
+}
+function hideHover(){
+  hoverOn=false;
+  if(hoverTimer){clearTimeout(hoverTimer);hoverTimer=null}
+  document.getElementById("hover").style.display="none";
+}
+
+function showPanel(id){
+  var n=S.byId[id];if(!n)return;
+  var rows="";
+  function row(k,v){rows+='<div class="row"><span class="k">'+k+'</span>'+(v?esc(v):"—")+"</div>"}
+  row("类型",KIND[n.kind]+" ("+n.kind+")");
+  row("状态",STAT[n.status]+" ("+n.status+")");
+  row("标题",n.title);
+  row("刻度","轮次 "+roundsOf(n)+" · 尝试 "+n.attempts+" 次");
+  row("描述",n.detail);
+  row("why",n.why);
+  row("备注",n.note);
+  row("创建",n.created_at);
+  row("更新",n.updated_at);
+  var evts=(S.st.events||[]).filter(function(e){return e.node_id===id});
+  var evHtml="";
+  if(evts.length){
+    evHtml='<div class="evt">事件史:<br>'+evts.map(function(e){
+      var s=e.seq+". "+e.ts+" "+e.op;
+      if(e.fields&&e.fields.status)s+=" → "+e.fields.status;
+      if(e.op==="node_touch"&&e.note)s+=": "+e.note;
+      return esc(s);
+    }).join("<br>")+"</div>";
+  }
+  document.getElementById("pbody").innerHTML="<h3>"+esc(clip(n.title,20))+"</h3>"+rows+evHtml;
+  document.getElementById("panel").style.display="block";
+}
+
+function applyT(){vp.setAttribute("transform","translate("+S.tx+","+S.ty+") scale("+S.scale+")")}
+function tweenView(tx,ty,s){ // 视图切换缓动;独立令牌;隐藏页/测试模式直接落定
+  if(document.hidden||S.noAnim){S.scale=s;S.tx=tx;S.ty=ty;applyT();return}
+  var f={x:S.tx,y:S.ty,s:S.scale},t0=null,started=false,tok=(S.viewTok=(S.viewTok||0)+1);
+  function step(ts){
+    if(tok!==S.viewTok)return;
+    started=true;
+    if(t0===null)t0=ts;
+    var k=Math.min(1,(ts-t0)/260);k=1-Math.pow(1-k,3);
+    S.scale=f.s+(s-f.s)*k;S.tx=f.x+(tx-f.x)*k;S.ty=f.y+(ty-f.y)*k;applyT();
+    if(k<1)requestAnimationFrame(step);
+  }
+  requestAnimationFrame(step);
+  setTimeout(function(){ // rAF 探测:后台面板 rAF 被冻结(首帧没来)时直接落定
+    if(tok!==S.viewTok)return;
+    if(!started){S.scale=s;S.tx=tx;S.ty=ty;applyT();}
+  },120);
+  setTimeout(function(){ // 收尾保险:动画被中途打断/冻结时收敛到终点
+    if(tok!==S.viewTok)return;
+    if(Math.abs(S.scale-s)>0.001||Math.abs(tx-S.tx)>1||Math.abs(ty-S.ty)>1){
+      S.scale=s;S.tx=tx;S.ty=ty;applyT();
+    }
+  },420);
+}
+function fit(){
+  if(!S.pos)return;
+  var xs=[],ys=[];
+  for(var k in S.pos){xs.push(S.pos[k].x);ys.push(S.pos[k].y)}
+  if(!xs.length)return;
+  var x0=Math.min.apply(null,xs),x1=Math.max.apply(null,xs)+W;
+  var y0=Math.min.apply(null,ys),y1=Math.max.apply(null,ys)+H;
+  var rect=stage.getBoundingClientRect();
+  var s=Math.min((rect.width-48)/Math.max(1,x1-x0),(rect.height-48)/Math.max(1,y1-y0),1.6);
+  tweenView((rect.width-(x1-x0)*s)/2-x0*s,(rect.height-(y1-y0)*s)/2-y0*s,s);
+}
+
+(function initPan(){
+  var drag=null;
+  stage.addEventListener("pointerdown",function(e){
+    if(e.button!==0)return;
+    drag={x:e.clientX,y:e.clientY,tx:S.tx,ty:S.ty};
+    S.dragMoved=false;
+    S.viewTok=(S.viewTok||0)+1; // 手动平移取消挂起的适配缓动,防回跳
+    stage.classList.add("dragging");
+  });
+  window.addEventListener("pointermove",function(e){
+    if(!drag)return;
+    if(Math.abs(e.clientX-drag.x)+Math.abs(e.clientY-drag.y)>4)S.dragMoved=true; // 拖动才算拖拽
+    S.tx=drag.tx+e.clientX-drag.x;S.ty=drag.ty+e.clientY-drag.y;applyT();
+  });
+  window.addEventListener("pointerup",function(){drag=null;stage.classList.remove("dragging")});
+  stage.addEventListener("wheel",function(e){
+    e.preventDefault();
+    var g=e.target&&e.target.closest?e.target.closest("g[data-id]"):null;
+    var n=g?S.byId[g.getAttribute("data-id")]:null;
+    if(n&&n.parent_id&&!e.ctrlKey&&Math.abs(e.deltaX)>Math.abs(e.deltaY)&&Math.abs(e.deltaX)>2){
+      var acc=(S.rotAcc[n.parent_id]||0)+e.deltaX;
+      if(Math.abs(acc)>=60){
+        S.sibRot[n.parent_id]=(S.sibRot[n.parent_id]||0)+(acc>0?1:-1);
+        S.rotAcc[n.parent_id]=0;
+        render();
+      }else S.rotAcc[n.parent_id]=acc;
+      return;
+    }
+    S.viewTok=(S.viewTok||0)+1; // 手动缩放取消挂起的适配缓动,防回跳
+    var f=e.deltaY<0?1.12:1/1.12;
+    var ns=Math.min(2.5,Math.max(0.15,S.scale*f));f=ns/S.scale;
+    var rect=stage.getBoundingClientRect();
+    var mx=e.clientX-rect.left,my=e.clientY-rect.top;
+    S.tx=mx-(mx-S.tx)*f;S.ty=my-(my-S.ty)*f;S.scale=ns;applyT();
+  },{passive:false});
+  stage.addEventListener("contextmenu",function(e){e.preventDefault()});
+  stage.addEventListener("click",function(e){
+    if(S.dragMoved){S.dragMoved=false;return;} // 拖完的收尾 click 不算点击,不清选中
+    if(e.target===stage||e.target.id==="vp"||e.target.id==="bg"){
+      S.sel=null;
+      render();
+      if(!S.focus)document.getElementById("panel").style.display="none";
+    }
+  });
+  window.addEventListener("resize",function(){if(S.pos)fit()});
+
+  var rot=null; // 转盘:右键按住某节点,它那排同辈变成跟手滑动的条带,松手落位
+  stage.addEventListener("pointerdown",function(e){
+    if(e.button!==2)return;
+    var g=e.target.closest?e.target.closest("g[data-id]"):null;
+    if(!g)return;
+    var n=S.byId[g.getAttribute("data-id")];
+    if(!n||!n.parent_id)return;
+    var ks=kidsOf(n.parent_id);
+    if(ks.length<2){
+      tip("该层只有一个节点,没有可旋转的同辈");setTimeout(function(){tip(null)},1400);return;
+    }
+    if(S.expandAll){ tip("展开全部模式下所有节点全显,无需旋转");setTimeout(function(){tip(null)},1400);return; }
+    if(n.parent_id===S.st.root_id&&ks.every(function(k){return S.byId[k]&&S.byId[k].kind==="step"})){
+      tip("主干默认全显,无需旋转");setTimeout(function(){tip(null)},1400);return;
+    }
+    rot={parent:n.parent_id,startX:e.clientX,base:S.sibRot[n.parent_id]||0};
+    S.rotatePreview={parent:rot.parent,offset:0};
+    stage.classList.add("rotating");
+    tip("↔ 转盘:拖动旋转,当前排及子树跟随滑动,渐隐=将落位");
+    e.stopPropagation();
+    render();
+    fit();
+  });
+  window.addEventListener("pointermove",function(e){
+    if(!rot)return;
+    var pitch=W+38;
+    var frac=(e.clientX-rot.startX)/pitch;
+    S.sibRot[rot.parent]=rot.base+Math.round(frac);
+    S.rotatePreview.offset=frac-Math.round(frac); // 条带连续跟手
+    render();
+  });
+  window.addEventListener("pointerup",function(){
+    if(!rot)return;
+    rot=null;S.rotatePreview=null;
+    stage.classList.remove("rotating");
+    tip(null);
+    render();
+  });
+})();
+
+document.getElementById("fit").onclick=fit;
+document.getElementById("cb-dead").onchange=function(e){S.collapse=e.target.checked;render()};
+function updateModeBtns(){
+  var special=!!S.expandAll||!!S.tidy;
+  document.getElementById("focus").classList.toggle("on",S.focus&&!special);
+  document.getElementById("pano").classList.toggle("on",!S.focus&&!special);
+  document.getElementById("expand").classList.toggle("on",!!S.expandAll);
+  document.getElementById("tidy").classList.toggle("on",!!S.tidy);
+  document.getElementById("cb-dead").disabled=special; // 特殊模式下折叠开关不适用
+}
+function setMode(m){
+  if(m==="expand"){ if(S.expandAll){S.expandAll=false;S.focus=true;} else {S.expandAll=true;S.tidy=false;S.focus=false;} }
+  else if(m==="tidy"){ if(S.tidy){S.tidy=false;S.focus=true;} else {S.tidy=true;S.expandAll=false;S.focus=false;} }
+  else { S.expandAll=false;S.tidy=false;S.focus=(m==="focus"); }
+  S.sel=null;
+  document.getElementById("panel").style.display="none";
+  updateModeBtns();render();fit();
+  setTimeout(function(){fit()},350); // 双适配:防止切模式时偶发的旧布局竞态
+}
+document.getElementById("focus").onclick=function(){setMode("focus")};
+document.getElementById("pano").onclick=function(){setMode("pano")};
+document.getElementById("expand").onclick=function(){setMode("expand")};
+document.getElementById("tidy").onclick=function(){setMode("tidy")};
+updateModeBtns();
+document.getElementById("close").onclick=function(){document.getElementById("panel").style.display="none"};
+
+boot();
+setInterval(async function(){
+  try{
+    var j=await (await fetch("/api/trees")).json();
+    var sel=document.getElementById("treesel");
+    if(j.trees.length===sel.options.length)return;
+    var cur=sel.value;
+    sel.innerHTML="";
+    j.trees.forEach(function(t){var o=document.createElement("option");o.value=t.tree_id;o.textContent=t.name;sel.appendChild(o)});
+    if(cur&&Array.prototype.some.call(sel.options,function(o){return o.value===cur}))sel.value=cur;
+    document.getElementById("hint").style.display=j.trees.length?"none":"block";
+  }catch(e){}
+},4000);
+</script>
+</body>
+</html>

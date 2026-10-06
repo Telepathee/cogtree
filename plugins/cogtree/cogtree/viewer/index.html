@@ -1,0 +1,915 @@
+<!doctype html>
+<html lang="zh">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>cogtree 工作树</title>
+<style>
+  html,body{margin:0;height:100%;overflow:hidden;font-family:"Microsoft YaHei","PingFang SC",system-ui,sans-serif;background:#f6f8fb;color:#1d2433}
+  #bar{position:fixed;top:0;left:0;right:0;height:46px;background:rgba(255,255,255,.92);backdrop-filter:blur(6px);border-bottom:1px solid #e8ecf2;display:flex;align-items:center;gap:10px;padding:0 14px;z-index:20;box-sizing:border-box}
+  #bar .logo{font-weight:800;font-size:15px;letter-spacing:.5px;background:linear-gradient(90deg,#2f6fed,#8a5fe8);-webkit-background-clip:text;background-clip:text;color:transparent;white-space:nowrap}
+  #bar select,#bar button{font:inherit;font-size:13px;padding:4px 12px;border:1px solid #d8deea;border-radius:8px;background:#fff;cursor:pointer;box-shadow:0 1px 2px rgba(20,30,60,.05)}
+  #meta{color:#69738a;font-size:12.5px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+  #meta b{color:#c23a3a}
+  label.toggle{font-size:12.5px;color:#3d4658;display:flex;align-items:center;gap:4px;white-space:nowrap;cursor:pointer}
+  #stage{position:absolute;top:46px;left:0;right:0;bottom:0;width:100%;height:calc(100% - 46px);cursor:grab}
+  #stage.dragging{cursor:grabbing}
+  #stage.rotating{cursor:ew-resize}
+  #hint{position:absolute;top:60px;left:20px;color:#8a93a6;font-size:13px}
+  #tip{position:fixed;top:52px;left:50%;transform:translateX(-50%);background:#20293a;color:#e8ecf4;border-radius:999px;
+       padding:5px 16px;font-size:12px;display:none;z-index:25;pointer-events:none}
+  #hover{position:fixed;display:none;width:320px;background:#20293a;color:#e8ecf4;border-radius:10px;padding:12px 14px;
+         box-shadow:0 10px 32px rgba(15,22,36,.4);z-index:30;pointer-events:none;font-size:12.5px;line-height:1.6}
+  #hover .t{font-size:14px;font-weight:700;margin-bottom:4px}
+  #hover .kv{margin:2px 0;word-break:break-all}
+  #hover .k{color:#93a0b8;margin-right:6px}
+  #hover .evt{color:#93a0b8;border-top:1px dashed #3a465e;margin-top:6px;padding-top:6px;font-size:11.5px}
+  #fab{position:fixed;right:18px;bottom:18px;width:52px;height:52px;border-radius:50%;border:none;cursor:pointer;background:linear-gradient(135deg,#2f6fed,#5b8bf3);color:#fff;font-size:13px;font-weight:700;letter-spacing:1px;box-shadow:0 6px 18px rgba(47,111,237,.45);z-index:30}
+</style>
+</head>
+<body>
+<div id="bar">
+  <span class="logo">cogtree 工作树</span>
+  <select id="treesel"></select>
+  <span id="meta"></span>
+  <span id="build" title="viewer 构建时间(两边不一致时对比这里)" style="color:#9aa5ba;font-size:11.5px;white-space:nowrap"></span>
+  <span style="flex:1"></span>
+  <label class="toggle"><input type="checkbox" id="cb-dead">折叠死路子树</label>
+</div>
+<svg id="stage" xmlns="http://www.w3.org/2000/svg"><g id="vp"></g></svg>
+<div id="hint" style="display:none">还没有工作树——在对话里让模型调 tree_init 建一棵,这里会实时出现。</div>
+<div id="tip"></div>
+<div id="hover"></div>
+<button id="fab" title="点此展开全部">展开</button>
+<script>
+"use strict";
+var COLOR={open:"#8a93a6",active:"#2f6fed",blocked:"#e6892f",resolved:"#2fa14d",dead_end:"#c23a3a",abandoned:"#b7bdc8"};
+var KIND={problem:"拆解",explore:"发散",attempt:"尝试",finding:"结论",decision:"裁决",step:"步骤"};
+var KCOL={problem:"#69738a",step:"#2f6fed",explore:"#8a5fe8",attempt:"#0e9888",finding:"#2fa14d",decision:"#b05e12"};
+var STAT={open:"待办",active:"进行中",blocked:"受阻",resolved:"已解决",dead_end:"死路",abandoned:"放弃"};
+var CIRC="①②③④⑤⑥⑦⑧⑨⑩⑪⑫⑬⑭⑮⑯⑰⑱⑲⑳";
+var W=228,H=80,GV=40,WIN=3,MAXDOTS=8;
+var PITCH=W+38,RINGA=1.5*PITCH,RINGB=40,PHI1=34,SECTGAP=54,TRUNKGAP=64; // 环:横半轴/纵半轴/正弧半角;主干:节间距/首站距
+var BRANCH=[212,165,268,28,338,190,110,300]; // 主干色相环:①②③…各取一色,子代按代数加深
+var S={cur:null,st:null,es:null,poll:null,tx:60,ty:40,scale:1,sel:null,collapse:false,
+       center:null,open:{},sibRot:{},rotAcc:{},spinning:false,pos:{},byId:{},kidsBy:{},stepSeq:{},depth:{},animTok:0,viewTok:0,dragMoved:false,expandAll:false};
+var stage=document.getElementById("stage"),vp=document.getElementById("vp");
+
+function esc(s){return String(s==null?"":s).replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;").replace(/\"/g,"&quot;")}
+function clip(s,n){s=String(s==null?"":s);return s.length>n?s.slice(0,n-1)+"…":s}
+function meta(html){document.getElementById("meta").innerHTML=html}
+function tip(msg){
+  var el=document.getElementById("tip");
+  if(!msg){el.style.display="none";return}
+  el.textContent=msg;el.style.display="block";
+}
+
+function hashTree(){
+  try{ if(location.hash.length>1)return decodeURIComponent(location.hash.slice(1)); }catch(e){}
+  return null;
+}
+var BUILD="__COGTREE_BUILD__";
+window.addEventListener("hashchange",function(){
+  var w=hashTree();
+  if(w&&w!==S.cur){
+    var sel=document.getElementById("treesel");
+    if(sel)sel.value=w;
+    load(w);
+  }
+});
+async function boot(){
+  var b=document.getElementById("build");
+  if(b)b.textContent="构建 "+(BUILD.indexOf("__")===0?"dev":BUILD);
+  var j=await (await fetch("/api/trees")).json();
+  var trees=j.trees||[];
+  var sel=document.getElementById("treesel");
+  sel.innerHTML="";
+  trees.forEach(function(t){var o=document.createElement("option");o.value=t.tree_id;o.textContent=t.name;sel.appendChild(o)});
+  sel.onchange=function(){load(sel.value)};
+  document.getElementById("hint").style.display=trees.length?"none":"block";
+  if(trees.length){
+    var want=hashTree();
+    var pick=(want&&trees.some(function(t){return t.tree_id===want}))?want:trees[0].tree_id;
+    sel.value=pick;
+    load(pick);
+  }else meta("");
+}
+async function load(id){
+  S.cur=id;S.sel=null;S.center=null;S.open={};S.sibRot={};S.rotAcc={};
+  S.expandAll=false;S.stShift={}; // 换树/重载后贴边量重算
+  var fb=document.getElementById("fab");if(fb)fb.textContent="展开";
+  S.pos={}; // 换树清动画基线,避免节点从旧树布局位置飞入
+  var wantHash=encodeURIComponent(id);
+  if(location.hash.slice(1)!==wantHash)location.hash=wantHash; // URL 锚点记录当前树,两边可开同一地址
+  S.st=await (await fetch("/api/tree/"+encodeURIComponent(id))).json();
+  connect();
+  var act0=S.st.nodes.filter(function(nn){return nn.status==="active"});
+  var c0=act0.length?act0[act0.length-1].id:(S.st.nodes[0]||{}).id;
+  ensureChainWindow(c0);
+  if(c0&&S.st.nodes.some(function(n){return n.parent_id===c0}))S.open[c0]=true; // 默认中心预展开(此处在首次 render 前,kidsBy 还没建,用原始 nodes 判断)
+  render();setTimeout(fit,80);setTimeout(fit,500); // 二次适配:防重叠兜底可能右移边界
+}
+function connect(){
+  if(S.es)S.es.close();
+  if(S.poll){clearInterval(S.poll);S.poll=null}
+  var myTree=S.cur; // 树身份守卫:换树后旧树的 SSE/轮询结果必须丢弃,否则状态与渲染错配(会出现"孤儿卡")
+  var es=new EventSource("/api/stream/"+encodeURIComponent(myTree));
+  S.es=es;
+  es.addEventListener("state",function(e){ if(S.cur!==myTree)return; S.st=JSON.parse(e.data);render(); });
+  es.onerror=function(){
+    if(!S.poll)S.poll=setInterval(function(){
+      if(!S.cur||S.cur!==myTree)return;
+      fetch("/api/tree/"+encodeURIComponent(myTree)).then(function(r){return r.json()})
+        .then(function(j){ if(S.cur!==myTree)return; S.st=j;render(); }).catch(function(){});
+    },1500);
+  };
+}
+
+function kidsOf(id){return (S.kidsBy[id]||[]).slice().sort()}
+function roundsOf(n){return n.rounds_sub!=null?n.rounds_sub:(n.rounds||0)}
+function rowFullSet(pid){return kidsOf(pid)} // 环上全员可见:不再有窗口/芯片
+function wrapU(u,n){var m=((u%n)+n)%n;return m>n/2?m-n:m} // 最近等效 u′∈(−n/2,n/2]
+function phiOf(uu,n){ // 椭圆环轨(周期化):前排三张在正弧(±PHI1°),其余沿背面弧铺到 ±180°——首尾相接,可无限旋转
+  var au=Math.abs(uu),sgn=uu<0?-1:1;
+  var phi=au<=1?uu*PHI1:sgn*(PHI1+(au-1)*(180-PHI1)/Math.max(1,n/2-1));
+  return Math.max(-179.9,Math.min(179.9,phi));
+}
+function tfStr(id,x,y){ // 合成环映射:x'=s·x+tx, y'=s·y+ty(卡片、连线、整支子树同一变换)
+  var c=S.cx&&S.cx[id];
+  if(!c)return "translate("+x+","+y+")";
+  return "translate("+(x*c.s+c.tx).toFixed(1)+","+(y*c.s+c.ty).toFixed(1)+") scale("+c.s.toFixed(3)+","+c.s.toFixed(3)+")";
+}
+function FX(id,x){var c=S.cx&&S.cx[id];return c?c.s*x+c.tx:x} // 连线/脊线端点跟卡
+function FY(id,y){var c=S.cx&&S.cx[id];return c?c.s*y+c.ty:y}
+function brSet(h,g){ // 分支色:同一主干色相,代数越深越重;h<0 = 根/无主干祖先(中性蓝灰)
+  var hu=h<0?"222":String(BRANCH[h]),neu=h<0;
+  return {
+    c:"hsl("+hu+","+(neu?14:56)+"%,"+Math.max(31,62-10*g)+"%)",       // 左色条
+    tint:"hsl("+hu+","+(neu?20:46)+"%,"+Math.max(85,97-3*g)+"%)",     // 卡底浅染
+    border:"hsl("+hu+","+(neu?20:55)+"%,"+(neu?72:74)+"%)",           // 主干站描边
+    chip:"hsl("+hu+","+(neu?18:52)+"%,"+(neu?50:42)+"%)",             // 主干站色签
+    edge:"hsl("+hu+","+(neu?20:50)+"%,"+(neu?64:54)+"%)"              // 连线
+  };
+}
+
+
+function computeVisibility(){
+  // 单趟分类:每个节点恰好归入 全尺寸(full) / 隐藏(hidden) 之一(环模型下没有芯片档,行内全员在场)
+  var hidden={},full={};
+  if(!S.st)return hidden;
+  S.kidsBy={};
+  S.st.nodes.forEach(function(n){if(n.parent_id)(S.kidsBy[n.parent_id]=S.kidsBy[n.parent_id]||[]).push(n.id)});
+  var byId={}; // 本帧新鲜种类表
+  S.st.nodes.forEach(function(n){byId[n.id]=n});
+  function descendantsHidden(id){ // 芯片/折叠节点的后代全部隐藏
+    var stack=kidsOf(id);
+    while(stack.length){var x=stack.pop();if(!hidden[x]){hidden[x]=1;stack=kidsOf(x).concat(stack)}}
+  }
+  function isStep(id){return !!(byId[id]&&byId[id].kind==="step")}
+  // (折叠死路/展开覆盖在模式分支之后统一执行,见下方)
+  var parentOf={};S.st.nodes.forEach(function(n){if(n.parent_id)parentOf[n.id]=n.parent_id});
+  if(S.expandAll){
+    // 展开全部:所有节点全尺寸,无窗口无芯片
+    S.center=null;
+    S.st.nodes.forEach(function(n){full[n.id]=1});
+  }else{
+    var center=S.sel;
+    if(!center){
+      var act=S.st.nodes.filter(function(n){return n.status==="active"});
+      center=act.length?act[act.length-1].id:(S.st.nodes[0]?S.st.nodes[0].id:null);
+    }
+    S.center=center;
+    if(center){
+      full[center]=1;
+      var chain={};var c=center;while(c){chain[c]=1;c=parentOf[c];}
+      chain[S.st.root_id]=1;
+      for(var X in chain){
+        full[X]=1; // 链上节点(含根)全尺寸
+        kidsOf(X).forEach(function(s){ if(isStep(s))full[s]=1; });
+      }
+      var pc=parentOf[center];
+      if(pc!=null)rowFullSet(pc).forEach(function(k){full[k]=1}); // 同辈行照常显示(便于横向比较/切换)
+      if(S.open&&S.open[center])rowFullSet(center).forEach(function(k){full[k]=1}); // 中心子代:受"点节点展开"开关控制
+    }
+  }
+  // 展开集:只揭开"一层"(点谁开谁的直接孩子;再往下靠继续点那个孩子),可同时展开多个
+  for(var oid in S.open){
+    if(!S.open[oid])continue;
+    var anc=oid;while(anc){full[anc]=1;delete hidden[anc];anc=parentOf[anc];} // 展开项+祖先链一并点亮(导航换中心后不被藏、不产生孤儿)
+    delete hidden[oid];full[oid]=1; // 展开者本身点亮
+    rowFullSet(oid).forEach(function(k){full[k]=1;delete hidden[k]}); // 仅直接孩子一层
+  }
+  // 硬隐藏:折叠死路子树(最终仍生效,优先于显式展开)
+  if(S.collapse&&!S.expandAll){
+    S.st.nodes.forEach(function(n2){
+      if(n2.kind==="attempt"&&n2.status==="dead_end")descendantsHidden(n2.id);
+    });
+  }
+  // 终裁:硬隐藏 > 全尺寸 > 隐藏(环模型没有"芯片"档:行内全员在场)
+  S.st.nodes.forEach(function(n){
+    if(hidden[n.id])return;
+    if(full[n.id])return;
+    hidden[n.id]=1;
+  });
+  return hidden;
+}
+function layout(hidden){
+  var byId={};S.st.nodes.forEach(function(n){byId[n.id]=n});
+  S.byId=byId;
+  var kids={}; // 可见卡参与布局
+  S.st.nodes.forEach(function(n){
+    if(n.parent_id&&!hidden[n.id]&&!hidden[n.parent_id])
+      (kids[n.parent_id]=kids[n.parent_id]||[]).push(n.id);
+  });
+  var root=null;S.st.nodes.forEach(function(n){if(!n.parent_id)root=n.id});
+  S.pos={};S.byId=byId;S.ext={};S.depth={};S.lo={};S.bot={};S.rdep={};S.rkk={};S.stSide={};
+  if(root==null)return;
+  var PITCH=W+38,GAPW=30;
+  function shiftSubtreeY(id,dy){ // 子树整体下移(错层用;只动 y 与 bot,不动 x 跨度)
+    if(!S.pos[id])return;
+    S.pos[id].y+=dy;
+    if(S.bot[id]!=null)S.bot[id]+=dy;
+    (kids[id]||[]).forEach(function(c){shiftSubtreeY(c,dy)});
+  }
+  function cntDesc(id,km){var n=0,st2=[id];while(st2.length){var cur=st2.pop();(km[cur]||[]).forEach(function(c){n++;st2.push(c)})}return n}
+  function shiftSubtree(id,dx){
+    if(!S.pos[id])return;
+    S.pos[id].x+=dx;S.ext[id]=(S.ext[id]||0)+dx;
+    if(S.lo[id]!=null)S.lo[id]+=dx; // 绝对左界随子树一起移,否则后续让位读到过期值
+    (kids[id]||[]).forEach(function(c){shiftSubtree(c,dx)});
+  }
+  (function place(id,x,y,depth,isStation){
+    // 自顶向下。行口径:同辈≤WIN=普通横行(居中);>WIN=椭圆环(全员在环上,右键拖动沿轨转);
+    // 根行=纵向主干:站点从上往下沿脊线排列,每站的子树挂其下方,节与节之间留缝
+    S.pos[id]={x:x,y:y};S.depth[id]=depth;
+    var myK=S.rkk[id]||1; // 祖先链累计缩放(兜底推挤按实际卡面判重叠)
+    var all=(S.kidsBy[id]||[]).slice().sort();
+    var cs=all.filter(function(c){return !hidden[c]});
+    if(!cs.length){S.ext[id]=x+W;S.lo[id]=x;S.bot[id]=y+H;return}
+    function hasSub(k){var ks2=S.kidsBy[k]||[];for(var q=0;q<ks2.length;q++){if(!hidden[ks2[q]])return true}return false}
+    var isRootRow=(id===root);
+    var isCar=(!isRootRow&&all.length>WIN);
+    var s=isRootRow?0:(S.sibRot[id]||0);
+    if(isRootRow){
+      // 纵向主干:站点纵向堆叠(子树让开脊线的平移在各站点自己的 place 内做,ext/lo 随之增量校正)
+      var yy=y+H+TRUNKGAP,bot=y+H,ext=x+W,lo=x;
+      cs.forEach(function(st,si){
+        S.rkk[st]=myK;
+        S.stSide[st]=(si%2===0)?1:-1; // 主干站子树左右交替:1=挂右侧,-1=挂左侧(避免各站子树挤在同一列上下堆)
+        place(st,x,yy,depth+1,true);
+        bot=Math.max(bot,S.bot[st]||0);
+        ext=Math.max(ext,S.ext[st]||x+W);
+        lo=Math.min(lo,S.lo[st]!=null?S.lo[st]:x);
+        yy=(S.bot[st]||yy+H)+SECTGAP;
+      });
+      S.lo[id]=lo;S.ext[id]=ext;S.bot[id]=bot;
+    }else if(isCar){
+      // 椭圆环行(首尾相接,可无限旋转):槽位/角度都用 wrap 后的 u′∈(−n/2,n/2],s 无界;
+      // 行内让位与回正取消——背面挤压由 小+淡+后画 承担,残余重叠交给兜底推挤(按真实渲染坐标工作);
+      // 无让位 → shiftX≡0 → 椭圆中心恒钉在父卡中线(中轴恒定由结构保证,不再依赖补偿)
+      var nAll=all.length,rowY=y+H+GV;
+      cs.forEach(function(c){
+        var uu=wrapU(all.indexOf(c)-s-1,nAll);
+        var rad2=phiOf(uu,nAll)*Math.PI/180,dd2=(1-Math.cos(rad2))/2;
+        S.rdep[c]=dd2; // 环深(渲染端用)
+        S.rkk[c]=myK*(1-0.48*dd2); // 累计缩放传给整支子树(兜底推挤按实际卡面判重叠)
+        place(c, x+W/2+RINGA*Math.sin(rad2)-W/2, rowY, depth+1); // y 固定:椭圆的抬升只在渲染层做
+      });
+      // 相邻兄弟的可见子树在同一横带上会互相遮挡(029 的子树盖住 034 的左侧分支):分支多的整支下移错层。
+      // 判定用"前排最近弦距"(≈2·RINGA·sin34°≈275)与两支的相对跨度,与 s 无关 → 旋转时不再重排。
+      for(var jj=1;jj<cs.length;jj++){
+        var a=cs[jj-1],b=cs[jj];
+        if(!hasSub(a)||!hasSub(b))continue;
+        var rwa=((S.ext[a]!=null?S.ext[a]:S.pos[a].x+W))-S.pos[a].x;
+        var lwb=S.pos[b].x-((S.lo[b]!=null)?S.lo[b]:S.pos[b].x);
+        if(rwa+lwb<275)continue; // 两支窄到前排挨着也不撞 → 保持同一层
+        var da=cntDesc(a,kids),db=cntDesc(b,kids);
+        var dense=(da>=db)?a:b, other=(dense===a)?b:a;
+        var dh=((S.bot[other]!=null?S.bot[other]:rowY+H)-(rowY+H+GV));
+        if(dh>0)(kids[dense]||[]).forEach(function(c){shiftSubtreeY(c,dh+20)});
+      }
+      // 全周期预留(与 s 无关):卡在环上能到左右两个极点,子树随卡走 → 用"子树相对跨度"算极值;
+      // 若用"当前 s 的实际边界",行宽会随旋转变化 → 上行间距每帧重算 → 子树跟着来回挪(全展开时可见的闪烁)
+      var cx0=x+W/2;
+      var lo=cx0-RINGA-W/2,ext=cx0+RINGA+W/2,bot=y+H;
+      var KEXT=0.76; // 卡到达环极值附近时已缩到 ≈0.76(正弧 90°)~0.52(背面):子树随之缩小 → 预留按此折算
+      cs.forEach(function(c){
+        var rl=(S.pos[c].x-((S.lo[c]!=null)?S.lo[c]:S.pos[c].x))*KEXT; // 子树向左的相对跨度(按极值处缩放折算)
+        var rr=(((S.ext[c]!=null)?S.ext[c]:S.pos[c].x+W)-S.pos[c].x)*KEXT; // 向右
+        lo=Math.min(lo,cx0-RINGA-W/2-rl);
+        ext=Math.max(ext,cx0+RINGA+W/2+rr);
+        bot=Math.max(bot,S.bot[c]||0);
+      });
+      S.lo[id]=lo;S.ext[id]=ext;S.bot[id]=bot;
+    }else{
+      // 普通横行:居中;让位 = 节律 ∪ 子树避让(同环行)
+      var ly=y+H+GV,lo=x,ext=x+W,bot=y+H;
+      cs.forEach(function(c,i){ S.rkk[c]=myK;place(c,x+(i-(cs.length-1)/2)*PITCH,ly,depth+1); });
+      for(var j4=1;j4<cs.length;j4++){
+        var pv=cs[j4-1],nx2=cs[j4];
+        var needO=S.pos[pv].x+PITCH-S.pos[nx2].x;
+        var needS=(hasSub(pv)&&hasSub(nx2))?(S.ext[pv]+GAPW-(S.lo[nx2]!=null?S.lo[nx2]:S.pos[nx2].x)):0;
+        var need=Math.max(needO,needS);
+        if(need>0)shiftSubtree(nx2,need);
+      }
+      cs.forEach(function(c){
+        bot=Math.max(bot,S.bot[c]||0);
+        lo=Math.min(lo,(S.lo[c]!=null)?S.lo[c]:S.pos[c].x);
+        ext=Math.max(ext,S.ext[c]||0);
+      });
+      S.lo[id]=lo;S.ext[id]=ext;S.bot[id]=bot;
+    }
+    if(isStation){ // 主干站子树让开脊线:偶数站挂右、奇数站挂左;贴边量按"首次布局的实际内容边界"算一次后缓存
+      // (缓存 → 不随旋转重算,不抖;按实际内容而非"全周期最坏预留" → 不会放太远)
+      var side=(S.stSide&&S.stSide[id])||1,sh=(S.stShift&&S.stShift[id]);
+      if(sh==null){
+        var mlo2=1e9,mhi2=-1e9;
+        (kids[id]||[]).forEach(function(c){
+          mlo2=Math.min(mlo2,(S.lo[c]!=null)?S.lo[c]:S.pos[c].x);
+          mhi2=Math.max(mhi2,S.ext[c]!=null?S.ext[c]:S.pos[c].x+W);
+        });
+        sh=(mlo2<1e8)?((side>0)?((x+W+14)-mlo2):((x-14)-mhi2)):0;
+        if(S.stShift)S.stShift[id]=sh;
+      }
+      if(sh&&Math.abs(sh)>0.5){
+        (kids[id]||[]).forEach(function(c){shiftSubtree(c,sh)});
+        S.ext[id]=(S.ext[id]||x+W)+sh;S.lo[id]=(S.lo[id]!=null?S.lo[id]:x)+sh;
+      }
+    }
+  })(root,0,24,0,false);
+  // 防遮挡兜底:可见卡片两两不相交,同高度带内的冲突者右移(缩略堆等的安全网)
+  for(var pass=0;pass<3;pass++){
+    var vis=[];
+    for(var id2 in S.pos){
+      if(hidden[id2])continue;
+      var kk=S.rkk[id2]||1; // 环上卡及其子树按累计缩放后的实际卡面算,否则"按全尺寸"幽灵互挤
+      vis.push({id:id2,x:S.pos[id2].x,y:S.pos[id2].y,w:W*kk,h:H*kk});
+    }
+    vis.sort(function(a,b){return a.x-b.x});
+    var moved=false;
+    for(var i2=0;i2<vis.length;i2++)for(var j2=i2+1;j2<vis.length;j2++){
+      var A=vis[i2],B=vis[j2];
+      if(A.x>=B.x+B.w)continue;
+      var yOv=Math.min(A.y+A.h,B.y+B.h)-Math.max(A.y,B.y);
+      var xOv=Math.min(A.x+A.w,B.x+B.w)-Math.max(A.x,B.x);
+      if(yOv>4&&xOv>0){
+        // 凡被缩放的环卡(含其后代):背面弧上本就该挤成一小摞(小而淡、压底层),不推——
+        // 推了会随旋转逐帧闪现/回弹(这正是全展开拖动时'子树闪烁'的来源)
+        if((S.rkk&&S.rkk[A.id])<0.97||(S.rkk&&S.rkk[B.id])<0.97)continue;
+        var mv=(B.x>=A.x?B:A),anch=(mv===B?A:B);
+        // 站点(主干步骤)不推,优先推子树卡
+        if(byId[mv.id]&&byId[mv.id].kind==="step"&&!(byId[anch.id]&&byId[anch.id].kind==="step")){
+          mv=anch;anch=(mv===A?B:A);
+        }
+        var nx=anch.x+anch.w+10;
+        if(nx>mv.x){mv.x=nx;S.pos[mv.id].x=nx;moved=true}
+      }
+    }
+    if(!moved)break;
+  }
+  S.stepSeq={};
+  for(var pid2 in kids){
+    var i=0;
+    (kids[pid2]||[]).slice().sort().forEach(function(k){
+      if(byId[k]&&byId[k].kind==="step")S.stepSeq[k]=++i;
+    });
+  }
+}
+
+function resultLine(n){
+  if(n.status==="dead_end"&&n.why)return{t:"为何不通: "+n.why,c:"#c23a3a"};
+  if(n.status==="resolved"){
+    var s=n.detail||n.note;
+    if(s)return{t:"结果: "+s,c:"#1f7a3d"};
+  }
+  if(n.status==="blocked"&&n.note)return{t:"受阻: "+n.note,c:"#b05e12"};
+  return null;
+}
+
+function dotsSvg(n){
+  var r=roundsOf(n);
+  if(!r)return"";
+  var shown=Math.min(r,MAXDOTS),s="";
+  for(var i=0;i<shown;i++)s+='<circle cx="'+(W-9-8*i)+'" cy="12" r="3" fill="#9aa5ba"/>';
+  if(r>MAXDOTS)s+='<text x="'+(W-9-8*shown-2)+'" y="15.5" font-size="10" fill="#9aa5ba" text-anchor="end">×'+r+'</text>';
+  return s+"<title>"+esc("轮次: "+r+" 轮(含其下全部问题)")+"</title>";
+}
+
+function chip(label,color){
+  var w=label.length*10+12;
+  return {w:w,svg:'<rect width="'+w+'" height="16" rx="8" fill="'+color+'"/>'+
+    '<text x="'+(w/2)+'" y="11" font-size="9.5" fill="#fff" text-anchor="middle" font-weight="600">'+esc(label)+'</text>'};
+}
+
+function cardFull(n,p,stuck,op){
+  var opa=(op==null||op>=0.999)?1:op;
+  var dimmed=opa<0.999;
+  var br=(S.br&&S.br[n.id])||null;
+  var col=COLOR[n.status];
+  var isStep=n.kind==="step";
+  var seq=S.stepSeq[n.id]||0;
+  var strike=n.status==="dead_end"?' text-decoration="line-through"':"";
+  var isCenter=S.sel===n.id||S.center===n.id;
+  var tint=n.status==="dead_end"?"#fdf3f3":(br?br.tint:(isStep?"#f4f8ff":"#ffffff"));
+  var stroke=isCenter?' stroke="#2f6fed" stroke-width="2.2"':(isStep?(' stroke="'+(br?br.border:"#a9c4f7")+'" stroke-width="1.4"'):' stroke="#e6eaf2" stroke-width="1"');
+  var ring="";
+  if(stuck[n.id]){
+    ring='<circle cx="'+(W/2)+'" cy="'+(H/2)+'" r="40" fill="none" stroke="#c23a3a" stroke-width="2">'+
+      '<animate attributeName="r" values="36;44;36" dur="1.6s" repeatCount="indefinite"/>'+
+      '<animate attributeName="stroke-opacity" values="0.9;0.25;0.9" dur="1.6s" repeatCount="indefinite"/></circle>';
+  }
+  var headLabel=isStep?("主干 "+(CIRC[seq-1]||seq)):KIND[n.kind];
+  var c=chip(headLabel,(isStep&&br)?br.chip:(KCOL[n.kind]||"#69738a"));
+  var head='<g transform="translate(12,8)">'+c.svg+'</g>'+
+    '<text x="'+(12+c.w+6)+'" y="20" font-size="10" fill="#9aa5ba">'+
+    esc(clip(n.id+(n.attempts>0?" · 试"+n.attempts+"次":""),14))+'</text>';
+  var kidsN2=kidsOf(n.id).length;
+  var expMark="";
+  if(kidsN2){ // 可展开标记(系统判定:有子节点才画):▸未展开 / ▾已展开,放在编号与右上轮次点之间
+    var idStr=clip(n.id+(n.attempts>0?" · 试"+n.attempts+"次":""),14),wEst=0;
+    for(var qi=0;qi<idStr.length;qi++)wEst+=(idStr.charCodeAt(qi)>255?9.6:5.4);
+    var isOpen2=!!(S.open&&S.open[n.id]);
+    expMark='<text x="'+(12+c.w+6+wEst+8)+'" y="21" font-size="14" font-weight="700" fill="'+(isOpen2?"#2f6fed":"#9aa5ba")+'">'+(isOpen2?"▾":"▸")+
+      '<title>'+esc(isOpen2?"已展开:再点该节点收起":"可展开:点该节点展开它的子节点")+'</title></text>';
+  }
+  var title='<text x="13" y="41" font-size="14" font-weight="600" fill="#1d2433"'+strike+">"+esc(clip(n.title,14))+
+    "<title>"+esc(n.title)+"</title></text>";
+  var detail=n.detail?'<text x="13" y="58" font-size="10.5" fill="#7a8294">'+esc(clip(n.detail,19))+
+    "<title>"+esc(n.detail)+"</title></text>":"";
+  var rl=resultLine(n);
+  var result=rl?'<text x="13" y="'+(H-10)+'" font-size="10.5" fill="'+rl.c+'">'+esc(clip(rl.t,14))+
+    "<title>"+esc(rl.t)+"</title></text>":"";
+  var stTx='<text x="'+(W-26)+'" y="'+(H-10)+'" font-size="10.5" fill="'+(stuck[n.id]?"#c23a3a":col)+'"'+
+    (stuck[n.id]?' font-weight="700"':'')+' text-anchor="end">'+esc(STAT[n.status])+'</text>';
+  var active=n.status==="active"?'<g transform="translate(-14,'+(H/2)+')"><circle r="9" fill="#2f6fed"/>'+
+    '<path d="M-3 -5L5 0L-3 5z" fill="#fff"/></g>':"";
+  // 祖先里有后排环卡(不含本卡自己的环位)=本卡的子树只展示、不可操作(点了会让环乱转);
+  // 后排环卡本身仍可点:点它=沿轨就近旋进前排
+  var ownK=(S.rdep&&S.rdep[n.id]!=null)?(1-0.48*S.rdep[n.id]):1;
+  var inBackSub=!!(S.rkk&&S.rkk[n.id]!=null&&(S.rkk[n.id]/ownK)<0.97);
+  var startMark=(S.ringStart&&S.ringStart[n.id])?'<circle cx="7" cy="'+(H/2)+'" r="6" fill="#f5b301" stroke="#fff" stroke-width="1.5"/><text x="7" y="'+(H/2+3.5)+'" font-size="8" text-anchor="middle" fill="#7a5200" font-weight="700">起</text><title>环起点(初始最左侧节点)</title>':'';
+    return '<g transform="'+tfStr(n.id,p.x,p.y)+'" style="'+(inBackSub?"cursor:default;pointer-events:none":"cursor:pointer")+'" opacity="'+opa+'"'+(dimmed?' data-thumb="1"':'')+' data-id="'+n.id+'">'+
+    '<rect width="'+W+'" height="'+H+'" rx="12" fill="'+tint+'"'+stroke+'/>'+
+    '<rect width="5" height="'+H+'" rx="2.5" fill="'+(br?br.c:col)+'"/>'+
+    startMark+ring+head+expMark+title+detail+result+stTx+dotsSvg(n)+active+"</g>";
+}
+
+function render(){
+  hideHover();
+  var prev=S.pos||{}; // 上一帧位置,供位移动画
+  if(!S.st||!S.st.nodes||!S.st.nodes.length){vp.innerHTML="";meta("");return}
+  var hidden=computeVisibility();
+  layout(hidden);
+  // 分支色:主干站点各一色相(序号按全量兄弟数,不随可见性漂移),其下每代加深;非主干节点继承最近主干祖先
+  var stepOrd={},gk0=S.kidsBy;
+  Object.keys(gk0).forEach(function(pid){
+    var i=0;gk0[pid].slice().sort().forEach(function(k){
+      var n2=S.byId[k];if(n2&&n2.kind==="step")stepOrd[k]=++i;
+    });
+  });
+  S.br={};
+  (function colorize(id,h,g){
+    var n=S.byId[id];
+    if(n&&n.kind==="step"&&id!==S.st.root_id){ h=(h+(stepOrd[id]||1))%BRANCH.length; g=0; }
+    S.br[id]=brSet(h,g);
+    (S.kidsBy[id]||[]).forEach(function(c){ colorize(c,h,g+1) });
+  })(S.st.root_id,-1,0);
+  var stuck=S.st.stuck||{};
+
+  // 椭圆环:同辈>WIN 的行,卡片沿椭圆轨运行(u=i−s−1 连续,前三张在正弧,其余绕背面);
+  // 自身映射=平移到环上位置+按深度缩小;再自顶向下合成 → 卡片、连线、整支子树同一变换
+  // (必须在连线/脊线之前算好:它们用 FX/FY 跟卡)
+  var deps={},owns={};
+  S.ringPos={};
+  S.ringStart={};
+  S.st.nodes.forEach(function(n){
+    if(!n.parent_id)return;
+    if(n.parent_id===S.st.root_id)return; // 主干站不进环
+    var ks=S.kidsBy[n.parent_id];
+    if(!ks||ks.length<=WIN)return;
+    var i=ks.indexOf(n.id);
+    if(i<0||!S.pos[n.id]||!S.pos[n.parent_id])return;
+    var nn=ks.length,sv=S.sibRot[n.parent_id]||0;
+    if(i===0)S.ringStart[n.id]=1; // 初始最左侧节点(环起点)标记
+    var uu=wrapU(i-sv-1,nn);
+    var phi=phiOf(uu,nn),rad=phi*Math.PI/180;
+    var d=(1-Math.cos(rad))/2;
+    deps[n.id]=d;
+    // layout 已把卡放到椭圆 x 位,y 固定 → 自身映射=绕卡左上等比缩放 + 环抬升(子树经父链合成刚性跟随)
+    var k=1-0.48*d,lift=-RINGB*(1-Math.cos(rad));
+    owns[n.id]={k:k,tx:S.pos[n.id].x*(1-k),ty:S.pos[n.id].y*(1-k)+lift};
+    S.ringPos[n.id]={x:S.pos[n.id].x,y:S.pos[n.id].y+lift,k:k,d:d,uu:uu}; // 环的渲染目标点(含抬升),供测试断言
+  });
+  S.deps=deps; // 环深暴露给测试断言(链式淡出的期望值)
+  // 合成映射 F(子)=F(父)∘自身环映射:整支子树刚性跟随父卡绕环
+  S.cx={};
+  (function compose(id,SS,TX,TY){
+    var o=owns[id];
+    if(o){
+      TX=SS*o.tx+TX;TY=SS*o.ty+TY;SS=SS*o.k;
+    }
+    if(SS!==1||TX!==0||TY!==0)S.cx[id]={s:SS,tx:TX,ty:TY};
+    (S.kidsBy[id]||[]).forEach(function(c){compose(c,SS,TX,TY)});
+  })(S.st.root_id,1,0,0);
+
+  // 纵向脊线:根→各主干站(从上往下),站点卡压在脊线上;更深的 step 组仍用横向小带
+  var bands="",banded={};
+  var rStps=kidsOf(S.st.root_id).filter(function(k){return S.pos[k]});
+  if(rStps.length){
+    rStps.forEach(function(k){banded[k]=1});
+    var yT=S.pos[S.st.root_id].y+H,yB=S.pos[rStps[rStps.length-1]].y+H/2;
+    var sx2=S.pos[S.st.root_id].x+W/2;
+    bands+='<rect x="'+(sx2-3)+'" y="'+(yT+4)+'" width="6" height="'+Math.max(0,yB-yT-4)+'" rx="3" fill="url(#bandgv)"/>';
+    bands+='<path d="M'+(sx2-7)+' '+(yB-9)+'L'+sx2+' '+yB+'L'+(sx2+7)+' '+(yB-9)+
+      '" fill="none" stroke="#5b8bf3" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"/>';
+  }
+  for(var pid in S.kidsBy){
+    if(pid===S.st.root_id)continue; // 根行=纵向脊线,上面已画
+    var steps=kidsOf(pid).filter(function(k){return S.byId[k]&&S.byId[k].kind==="step"&&!hidden[k]});
+    if(!steps.length)continue;
+    if((S.kidsBy[pid]||[]).length>WIN)continue; // 环上的 step 组不画带,退回普通连线
+    try{
+    steps.forEach(function(k){banded[k]=1});
+    var y=S.pos[steps[0]].y+H/2;
+    var x1=FX(steps[0],S.pos[steps[0]].x)-16,x2=FX(steps[steps.length-1],S.pos[steps[steps.length-1]].x+W)+18;
+    var bw=Math.max(4,6-(S.depth[steps[0]]||1));
+    if(S.pos[pid]){
+      var px=FX(pid,S.pos[pid].x+W/2),py=FY(pid,S.pos[pid].y+H);
+      // 走廊布线:在父行与站点行之间的空带水平横移,再落入带首——绝不穿过任何卡片
+      var topY=y-H/2-14,midY=py+(topY-py)*0.5;
+      if(py<topY)bands+='<path d="M'+px+' '+py+' L'+px+' '+midY+' L'+x1+' '+midY+' L'+x1+' '+y+
+        '" fill="none" stroke="#2f6fed" stroke-width="3" stroke-opacity="0.55" stroke-linecap="round" stroke-linejoin="round"/>';
+    }
+    bands+='<rect x="'+x1+'" y="'+(y-bw/2)+'" width="'+(x2-x1)+'" height="'+bw+'" rx="'+(bw/2)+
+      '" fill="url(#bandg)"/>';
+    bands+='<path d="M'+(x2-10)+' '+(y-6)+'L'+(x2-2)+' '+y+'L'+(x2-10)+' '+(y+6)+
+      '" fill="none" stroke="#5b8bf3" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"/>';
+    }catch(e){
+      window.__bandErr={msg:String(e),pid:pid,steps:steps.join(","),
+        laid:steps.map(function(k){return k+":"+(S.pos[k]?"Y":"N")}).join(","),
+        hiddenPid:!!hidden[pid]};
+      break;
+    }
+  }
+
+  var edges="";
+  S.st.nodes.forEach(function(n){
+    if(!n.parent_id||hidden[n.id]||hidden[n.parent_id])return;
+    if(banded[n.id])return; // 主干带已接管
+    var p=S.pos[n.parent_id],c=S.pos[n.id];
+    if(!p||!c)return;
+    var x1=FX(n.parent_id,p.x+W/2),y1=FY(n.parent_id,p.y+H),x2=FX(n.id,c.x+W/2),y2=FY(n.id,c.y+H/2);
+    var col=(S.br&&S.br[n.id])?S.br[n.id].edge:(COLOR[n.status]||"#999"); // 连线取子节点的分支色(同支同色)
+    var eo=(0.35*(1-0.55*(deps[n.id]||0))).toFixed(3); // 环背面的卡,连线同步减淡
+    edges+='<path d="M'+x1+' '+y1+' C'+x1+' '+(y1+GV/2+14)+','+x2+' '+(y2-GV/2-14)+','+x2+' '+y2+
+      '" fill="none" stroke="'+col+'" stroke-opacity="'+eo+'" stroke-width="2" stroke-linecap="round"/>';
+  });
+
+  var cards="";
+  var order=S.st.nodes.slice();
+  order.sort(function(a,b){ // 环背面的先画,正面的压在上层
+    var aa=deps[a.id]||0,ab=deps[b.id]||0;
+    if(aa!==ab)return ab-aa;
+    return a.id<b.id?-1:1;
+  });
+  function chainOp(id){ // 自身×整条祖先链的环深透明度:子树随父渐隐(乘积,封底0.14),不再整支消失
+    var v=1,c=S.byId[id];
+    while(c){
+      var d2=deps[c.id];
+      if(d2!=null)v*=Math.max(0.14,1-0.78*d2);
+      c=c.parent_id?S.byId[c.parent_id]:null;
+    }
+    return v;
+  }
+  order.forEach(function(n){
+    if(hidden[n.id]||!S.pos[n.id])return;
+    var op=chainOp(n.id);
+    if(op<0.06)return; // 环太挤时的兜底,正常到不了
+    cards+=cardFull(n,S.pos[n.id],stuck,op);
+  });
+  vp.innerHTML='<defs>'+
+    '<pattern id="dots" width="26" height="26" patternUnits="userSpaceOnUse"><circle cx="1.6" cy="1.6" r="1.4" fill="#e4e9f1"/></pattern>'+
+    '<linearGradient id="bandg" x1="0" y1="0" x2="1" y2="0"><stop offset="0" stop-color="#2f6fed"/><stop offset="1" stop-color="#7aa5f5"/></linearGradient>'+
+    '<linearGradient id="bandgv" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="#2f6fed"/><stop offset="1" stop-color="#7aa5f5"/></linearGradient>'+
+    '<marker id="arw" viewBox="0 0 10 10" refX="8.5" refY="5" markerWidth="6.5" markerHeight="6.5" orient="auto-start-reverse">'+
+    '<path d="M0 0L10 5L0 10z" fill="#5b8bf3"/></marker>'+
+
+    '</defs>'+
+    '<rect id="bg" x="-6000" y="-6000" width="16000" height="16000" fill="url(#dots)"/>'+
+    '<g id="ebox">'+bands+edges+'</g>'+cards;
+  var ebox=document.getElementById("ebox");
+  if(ebox){ebox.style.opacity="0.3";ebox.style.transition="opacity .18s ease";
+    requestAnimationFrame(function(){ebox.style.opacity="1"})}
+
+  // 动画:位移缓动+淡入;隐藏页直接落定;300ms 后自愈收敛(过渡被可见性切换冻结的兜底)
+  var tok=(S.animTok=(S.animTok||0)+1);
+  var canAnim=(!document.hidden)&&!S.noAnim&&!S.spinning; // 环拖拽期跟手;测试可置 S.noAnim
+  vp.querySelectorAll("g[data-id]").forEach(function(g){
+    var id=g.getAttribute("data-id");
+    var nw=S.pos[id],old=prev[id];
+    if(old&&(old.x!==nw.x||old.y!==nw.y)){
+      if(!canAnim){g.setAttribute("transform",tfStr(id,nw.x,nw.y));return}
+      var sx=old.x-nw.x,sy=old.y-nw.y,t0=null;
+      var stepMove=function(ts){
+        if(tok!==S.animTok)return;
+        if(t0===null)t0=ts;
+        var k=Math.min(1,(ts-t0)/230);k=1-Math.pow(1-k,3);
+        g.setAttribute("transform",tfStr(id,nw.x+sx*(1-k),nw.y+sy*(1-k)));
+        if(k<1)requestAnimationFrame(stepMove);
+        else g.setAttribute("transform",tfStr(id,nw.x,nw.y));
+      };
+      requestAnimationFrame(stepMove);
+    }else if(!old&&canAnim){
+      var tgt=g.getAttribute("opacity")||"1";
+      g.style.opacity="0";
+      g.style.transition="opacity .22s ease";
+      requestAnimationFrame(function(){
+        if(tok!==S.animTok)return;
+        g.style.opacity=tgt;
+        setTimeout(function(){if(tok===S.animTok){g.style.transition="";g.style.opacity="";}},260);
+      });
+    }
+  });
+  setTimeout(function(){
+    if(tok!==S.animTok)return;
+    vp.querySelectorAll('g[data-id]').forEach(function(g){
+      g.style.transition="none";g.style.opacity=""; // 清内联,渐隐由属性控制
+      var id3=g.getAttribute("data-id");
+      var nw2=S.pos[id3]; // 后台冻结时从半路落定到终点
+      if(nw2)g.setAttribute("transform",tfStr(id3,nw2.x,nw2.y));
+    });
+    var eb=document.getElementById("ebox");
+    if(eb){eb.style.transition="";eb.style.opacity="1";}
+  },300);
+
+  vp.querySelectorAll("g[data-id]").forEach(function(g){
+    var id=g.getAttribute("data-id");
+    g.addEventListener("click",function(ev){
+      ev.stopPropagation();
+      if(S.dragMoved){S.dragMoved=false;return;} // 拖拽收尾的伪 click 不选中
+      select(id); // 点亮卡=看详情;点明显渐隐(环背面)的卡=沿轨旋进前排
+    });
+    g.addEventListener("mouseenter",function(ev){hoverTimer=setTimeout(function(){showHover(id,ev)},160)});
+    g.addEventListener("mousemove",function(ev){if(hoverOn)moveHover(ev)});
+    g.addEventListener("mouseleave",hideHover);
+  });
+  var ns=Object.keys(stuck).length;
+  meta("节点 "+S.st.nodes.length+" · 事件 "+S.st.seq+" · "+(ns?("<b>卡点 "+ns+"</b>"):"无卡点")+
+    " · hash "+S.st.state_hash+" · "+S.st.updated_at);
+}
+
+function ensureChainWindow(id){ // 选中节点及其整条祖先链:所在行窗口必须包含它们(否则会被角度隐藏)
+  var c=id;
+  while(c){
+    var n2=S.byId[c];
+    if(!n2)break;
+    if(n2.parent_id&&n2.parent_id!==S.st.root_id){ // 主干排不转,无需保窗
+      var ks=kidsOf(n2.parent_id),idx=ks.indexOf(c);
+      if(idx>=0&&ks.length>WIN){ // 首尾相接:把该卡转到前排的"最近等效"s(可跨圈,方向最短)
+        var nk=ks.length,cur=S.sibRot[n2.parent_id]||0,base=idx-1,kn=Math.round((cur-base)/nk);
+        S.sibRot[n2.parent_id]=base+kn*nk;
+      }
+    }
+    c=n2.parent_id;
+  }
+}
+function animateRot(pid,target,onDone){ // 点选后整排沿环轨就近转到位(而不是瞬移)
+  var from=S.sibRot[pid]||0,to=target;
+  if(Math.abs(to-from)<0.01){S.sibRot[pid]=to;render();if(onDone)onDone();return}
+  if(document.hidden||S.noAnim){S.sibRot[pid]=to;render();if(onDone)onDone();return}
+  var t0=null,tok=(S.rotTok=(S.rotTok||0)+1); // 独立令牌:render() 每次会自增 S.animTok,不能共用
+  S.spinning=true;
+  var dur=Math.min(500,200+Math.abs(to-from)*120);
+  var step=function(ts){
+    if(tok!==S.rotTok)return;
+    if(t0===null)t0=ts;
+    var k=Math.min(1,(ts-t0)/dur);k=1-Math.pow(1-k,3);
+    S.sibRot[pid]=from+(to-from)*k;
+    render();
+    if(k<1)requestAnimationFrame(step);
+    else{S.sibRot[pid]=to;S.spinning=false;render();if(onDone)onDone()}
+  };
+  requestAnimationFrame(step);
+  setTimeout(function(){ // rAF 冻结兜底(后台页)
+    if(tok!==S.rotTok||!S.spinning)return;
+    S.sibRot[pid]=to;S.spinning=false;render();if(onDone)onDone();
+  },dur+150);
+}
+function select(id){
+  // 旋转链:直接父环沿轨"就近方向"转到位,更上层直接落位(替代旧的瞬移 ensureChainWindow)
+  var c=id,animPid=null,animTarget=null;
+  while(c){
+    var n2=S.byId[c];if(!n2)break;
+    if(n2.parent_id&&n2.parent_id!==S.st.root_id){
+      var ks=kidsOf(n2.parent_id),idx=ks.indexOf(c);
+      if(idx>=0&&ks.length>WIN){ // 首尾相接:取离当前 s 最近的等效目标 = 就近方向
+        var nk=ks.length,cur=S.sibRot[n2.parent_id]||0,base=idx-1,kn=Math.round((cur-base)/nk),tgt=base+kn*nk;
+        if(animPid==null){animPid=n2.parent_id;animTarget=tgt}
+        else S.sibRot[n2.parent_id]=tgt;
+      }
+    }
+    c=n2.parent_id;
+  }
+  // 点卡=选中+就近转动;同时切换这棵子树的展开/收起(可同时展开多棵,再点一次收起)
+  if(kidsOf(id).length>0&&!S.expandAll)S.open[id]=!S.open[id];
+  S.sel=id;
+  if(animPid!=null){
+    animateRot(animPid,animTarget,null);
+  }else{
+    S.spinning=false;
+    render();
+  }
+  // 不动视角:展开/收起/选中只改内容,缩放与平移保持原样(适配视图由"展开全部/收纳"按钮负责)
+}
+
+var hoverOn=false,hoverTimer=null;
+function showHover(id,ev){
+  var n=S.byId[id];if(!n)return;
+  var evts=(S.st.events||[]).filter(function(e){return e.node_id===id}).slice(-3);
+  var h='<div class="t">'+esc(n.title)+'</div>';
+  h+='<div class="kv"><span class="k">类型</span>'+esc(KIND[n.kind]+" · "+STAT[n.status])+"</div>";
+  h+='<div class="kv"><span class="k">刻度</span>'+esc("轮次 "+roundsOf(n)+" · 尝试 "+n.attempts+" 次")+"</div>";
+  if(n.detail)h+='<div class="kv"><span class="k">描述</span>'+esc(n.detail)+"</div>";
+  if(n.why)h+='<div class="kv"><span class="k">why</span>'+esc(n.why)+"</div>";
+  if(n.note)h+='<div class="kv"><span class="k">备注</span>'+esc(n.note)+"</div>";
+  if(evts.length)h+='<div class="evt">'+evts.map(function(e){
+    var s=e.ts+" "+e.op;
+    if(e.fields&&e.fields.status)s+=" → "+e.fields.status;
+    if(e.op==="node_touch"&&e.note)s+=": "+e.note;
+    return esc(s);
+  }).join("<br>")+"</div>";
+  var el=document.getElementById("hover");
+  el.innerHTML=h;el.style.display="block";
+  hoverOn=true;moveHover(ev);
+}
+function moveHover(ev){
+  var el=document.getElementById("hover");
+  var w=el.offsetWidth,hh=el.offsetHeight;
+  var x=ev.clientX+16,y=ev.clientY+16;
+  if(x+w>window.innerWidth-10)x=ev.clientX-w-16;
+  if(y+hh>window.innerHeight-10)y=ev.clientY-hh-16;
+  el.style.left=x+"px";el.style.top=y+"px";
+}
+function hideHover(){
+  hoverOn=false;
+  if(hoverTimer){clearTimeout(hoverTimer);hoverTimer=null}
+  document.getElementById("hover").style.display="none";
+}
+
+
+function applyT(){vp.setAttribute("transform","translate("+S.tx+","+S.ty+") scale("+S.scale+")")}
+function tweenView(tx,ty,s){ // 视图切换缓动;独立令牌;隐藏页/测试模式直接落定
+  if(document.hidden||S.noAnim){S.scale=s;S.tx=tx;S.ty=ty;applyT();return}
+  var f={x:S.tx,y:S.ty,s:S.scale},t0=null,started=false,tok=(S.viewTok=(S.viewTok||0)+1);
+  function step(ts){
+    if(tok!==S.viewTok)return;
+    started=true;
+    if(t0===null)t0=ts;
+    var k=Math.min(1,(ts-t0)/260);k=1-Math.pow(1-k,3);
+    S.scale=f.s+(s-f.s)*k;S.tx=f.x+(tx-f.x)*k;S.ty=f.y+(ty-f.y)*k;applyT();
+    if(k<1)requestAnimationFrame(step);
+  }
+  requestAnimationFrame(step);
+  setTimeout(function(){ // rAF 探测:后台面板 rAF 被冻结(首帧没来)时直接落定
+    if(tok!==S.viewTok)return;
+    if(!started){S.scale=s;S.tx=tx;S.ty=ty;applyT();}
+  },120);
+  setTimeout(function(){ // 收尾保险:动画被中途打断/冻结时收敛到终点
+    if(tok!==S.viewTok)return;
+    if(Math.abs(S.scale-s)>0.001||Math.abs(tx-S.tx)>1||Math.abs(ty-S.ty)>1){
+      S.scale=s;S.tx=tx;S.ty=ty;applyT();
+    }
+  },420);
+}
+function fit(){
+  if(!S.pos)return;
+  var xs=[],ys=[];
+  for(var k in S.pos){ // 用布局预留(含环的最大占位)做 bbox,否则环伸出部分会被视口裁掉
+    xs.push(S.lo[k]!=null?S.lo[k]:S.pos[k].x);
+    xs.push(S.ext[k]!=null?S.ext[k]:S.pos[k].x+W);
+    ys.push(S.pos[k].y);
+    ys.push(S.bot[k]!=null?S.bot[k]:S.pos[k].y+H);
+  }
+  if(!xs.length)return;
+  var x0=Math.min.apply(null,xs),x1=Math.max.apply(null,xs);
+  var y0=Math.min.apply(null,ys),y1=Math.max.apply(null,ys);
+  var rect=stage.getBoundingClientRect();
+  if(!isFinite(x1)||!isFinite(y1)||!isFinite(x0)||!isFinite(y0))return; // 布局异常时不适配,防NaN扩散
+  var s=Math.min((rect.width-48)/Math.max(1,x1-x0),(rect.height-48)/Math.max(1,y1-y0),1.6);
+  tweenView((rect.width-(x1-x0)*s)/2-x0*s,(rect.height-(y1-y0)*s)/2-y0*s,s);
+}
+
+(function(){
+  var drag=null;
+  stage.addEventListener("pointerdown",function(e){
+    if(e.button!==0)return; // 左键:按在可转节点上=旋转该排;空白/不可转处=平移视图
+    var g0=e.target.closest?e.target.closest("g[data-id]"):null;
+    var n0=g0?S.byId[g0.getAttribute("data-id")]:null;
+    var k0=(n0&&n0.parent_id)?kidsOf(n0.parent_id):[];
+    if(n0&&n0.parent_id&&n0.parent_id!==S.st.root_id&&k0.length>WIN){ startRot(n0.parent_id,e); return; }
+    drag={x:e.clientX,y:e.clientY,tx:S.tx,ty:S.ty};
+    S.dragMoved=false;
+    S.viewTok=(S.viewTok||0)+1; // 手动平移取消挂起的适配缓动,防回跳
+    stage.classList.add("dragging");
+  });
+  window.addEventListener("pointermove",function(e){
+    if(!drag)return;
+    if(Math.abs(e.clientX-drag.x)+Math.abs(e.clientY-drag.y)>4)S.dragMoved=true; // 拖动才算拖拽
+    S.tx=drag.tx+e.clientX-drag.x;S.ty=drag.ty+e.clientY-drag.y;applyT();
+  });
+  window.addEventListener("pointerup",function(){drag=null;stage.classList.remove("dragging")});
+  stage.addEventListener("wheel",function(e){
+    e.preventDefault();
+    var g=e.target&&e.target.closest?e.target.closest("g[data-id]"):null;
+    var n=g?S.byId[g.getAttribute("data-id")]:null;
+    if(n&&n.parent_id&&!e.ctrlKey&&Math.abs(e.deltaX)>Math.abs(e.deltaY)&&Math.abs(e.deltaX)>2){
+      if(n.parent_id===S.st.root_id)return; // 主干站纵向排列,不转
+      var acc=(S.rotAcc[n.parent_id]||0)+e.deltaX;
+      if(Math.abs(acc)>=60){
+        S.sibRot[n.parent_id]=(S.sibRot[n.parent_id]||0)+(acc>0?1:-1);
+        S.rotAcc[n.parent_id]=0;
+        render();
+      }else S.rotAcc[n.parent_id]=acc;
+      return;
+    }
+    S.viewTok=(S.viewTok||0)+1; // 手动缩放取消挂起的适配缓动,防回跳
+    var f=e.deltaY<0?1.12:1/1.12;
+    var ns=Math.min(2.5,Math.max(0.15,S.scale*f));f=ns/S.scale;
+    var rect=stage.getBoundingClientRect();
+    var mx=e.clientX-rect.left,my=e.clientY-rect.top;
+    S.tx=mx-(mx-S.tx)*f;S.ty=my-(my-S.ty)*f;S.scale=ns;applyT();
+  },{passive:false});
+  stage.addEventListener("contextmenu",function(e){e.preventDefault()});
+  stage.addEventListener("click",function(e){
+    if(S.dragMoved){S.dragMoved=false;return;} // 拖完的收尾 click 不算点击,不清选中
+    if(e.target===stage||e.target.id==="vp"||e.target.id==="bg"){
+      S.sel=null;
+      render();
+    }
+  });
+  window.addEventListener("resize",function(){if(S.pos)fit()});
+
+  var rot=null; // 椭圆环:左键按住环中某卡,整排(连各自子树)绕环轨转动,松手落位
+  function startRot(pid,e){
+    // 只登记,不渲染、不提示——纯点击时 DOM 必须原样,click 才能落到卡片/折叠钮上
+    rot={parent:pid,startX:e.clientX,base:S.sibRot[pid]||0,moved:false};
+    S.dragMoved=false;
+  }
+  window.addEventListener("pointermove",function(e){
+    if(!rot)return;
+    if(!rot.moved){
+      if(Math.abs(e.clientX-rot.startX)<=3)return; // 抖动阈值内不算拖动
+      rot.moved=true;S.dragMoved=true;S.spinning=true;
+      stage.classList.add("rotating");
+      tip("↔ 椭圆环:按住左键拖动,整排连子树绕环轨转动;首尾相接可无限转,金点=环起点,松手落位");
+    }
+    var ks=kidsOf(rot.parent),nk=ks.length;
+    var v=rot.base-(e.clientX-rot.startX)/(W+38); // 拖多少转多少(1:1)
+    S.sibRot[rot.parent]=v; // 首尾相接:s 无界,角度按周期映射
+    render();
+  });
+  function endRot(){
+    if(!rot)return;
+    var rp=rot.parent,wasMoved=rot.moved;
+    rot=null;
+    if(!wasMoved)return; // 纯点击:不落位、不渲染,让 click 正常派发(卡片选中/三角展开)
+    S.sibRot[rp]=Math.round(S.sibRot[rp]||0); // 落位:就近卡位,无范围钳制(首尾相接,转几圈停几圈)
+    S.spinning=false;
+    stage.classList.remove("rotating");
+    tip(null);
+    render(); // 布局重算,已有位移动画负责平滑收尾
+  }
+  window.addEventListener("pointerup",endRot);
+  window.addEventListener("pointercancel",endRot);
+  window.addEventListener("blur",endRot);
+})();
+
+document.getElementById("cb-dead").onchange=function(e){S.collapse=e.target.checked;render()};
+var fab=document.getElementById("fab");
+function updateFab(){
+  fab.textContent=S.expandAll?"收纳":"展开";
+  fab.title=S.expandAll?"点此收纳,回到默认聚焦":"点此展开全部";
+}
+fab.onclick=function(){
+  S.expandAll=!S.expandAll;
+  S.sel=null;
+  updateFab();render();fit();
+  setTimeout(function(){fit()},350);
+};
+
+boot().catch(function(e){meta("<b>启动失败:"+(e&&e.message||e)+"</b>");window.__bootErr=String(e&&e.stack||e);});
+setInterval(async function(){
+  try{
+    var j=await (await fetch("/api/trees")).json();
+    var sel=document.getElementById("treesel");
+    if(j.trees.length===sel.options.length)return;
+    var cur=sel.value;
+    sel.innerHTML="";
+    j.trees.forEach(function(t){var o=document.createElement("option");o.value=t.tree_id;o.textContent=t.name;sel.appendChild(o)});
+    if(cur&&Array.prototype.some.call(sel.options,function(o){return o.value===cur}))sel.value=cur;
+    document.getElementById("hint").style.display=j.trees.length?"none":"block";
+  }catch(e){}
+},4000);
+</script>
+</body>
+</html>

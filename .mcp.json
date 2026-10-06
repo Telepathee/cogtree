@@ -1,0 +1,13 @@
+{
+  "mcpServers": {
+    "cogtree": {
+      "command": "python",
+      "args": [
+        "${CLAUDE_PLUGIN_ROOT}/server.py"
+      ],
+      "env": {
+        "PYTHONIOENCODING": "utf-8"
+      }
+    }
+  }
+}

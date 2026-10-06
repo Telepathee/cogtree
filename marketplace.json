@@ -1,0 +1,22 @@
+{
+  "name": "cogtree",
+  "plugins": [
+    {
+      "name": "cogtree",
+      "source": "./plugins/cogtree",
+      "version": "1.0.0",
+      "description": "把 LLM 干活的思维过程落成跨会话可审计的工作树:MCP 工具 + 本地 2D 实时视图(主干纵向、子树横向、宽行椭圆环),节点/死路/卡点/轮次全部落盘可重放",
+      "displayName": "cogtree 思维工作树",
+      "displayName_i18n": {
+        "zh-CN": "cogtree 思维工作树"
+      },
+      "description_i18n": {
+        "zh-CN": "思维工作树:MCP 工具+本地2D实时视图,跨会话可审计,3次死路自动亮卡点"
+      },
+      "category": "developer-tools",
+      "author": {
+        "name": "cogtree"
+      }
+    }
+  ]
+}
